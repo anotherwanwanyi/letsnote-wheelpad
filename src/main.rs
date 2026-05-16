@@ -237,7 +237,7 @@ fn sd_notify_ready() -> std::io::Result<()> {
     use libsystemd::daemon::{notify, NotifyState};
     notify(false, &[NotifyState::Ready])
         .map(|_| ())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 fn install_signal_handlers() -> Result<()> {

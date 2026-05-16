@@ -145,12 +145,8 @@ impl Fsm {
                     // Contact (FUN_1400046a0 case 3, lines 127-137).
                     self.state = FsmState::Contact { origin: s };
                 } else {
-                    let swept = engagement_swept_angle(
-                        self.center_x,
-                        self.center_y,
-                        engage_start,
-                        s,
-                    );
+                    let swept =
+                        engagement_swept_angle(self.center_x, self.center_y, engage_start, s);
                     if swept.abs() > TRIGGER_ANGLE {
                         // Engagement! Reset detector and grab the pad.
                         detector.on_gesture_start();
@@ -163,7 +159,14 @@ impl Fsm {
                         detector.push_if_moved(s);
                         let ticks = detector.step(scroll.sensitivity);
                         if ticks != 0 {
-                            emit(&mut push_action, ticks, scroll, self.center_x, self.center_y, s);
+                            emit(
+                                &mut push_action,
+                                ticks,
+                                scroll,
+                                self.center_x,
+                                self.center_y,
+                                s,
+                            );
                         }
                     }
                     // else stay in Moving until either lift, slip-back,
@@ -183,7 +186,14 @@ impl Fsm {
                 detector.push_if_moved(s);
                 let ticks = detector.step(scroll.sensitivity);
                 if ticks != 0 {
-                    emit(&mut push_action, ticks, scroll, self.center_x, self.center_y, s);
+                    emit(
+                        &mut push_action,
+                        ticks,
+                        scroll,
+                        self.center_x,
+                        self.center_y,
+                        s,
+                    );
                 }
             }
 
@@ -238,10 +248,18 @@ fn emit(
             scroll.horizontal_end,
         )
     {
-        let signed = if scroll.reverse_horizontal { -ticks } else { ticks };
+        let signed = if scroll.reverse_horizontal {
+            -ticks
+        } else {
+            ticks
+        };
         push(Action::EmitWheelH(signed));
     } else {
-        let signed = if scroll.reverse_vertical { -ticks } else { ticks };
+        let signed = if scroll.reverse_vertical {
+            -ticks
+        } else {
+            ticks
+        };
         push(Action::EmitWheelV(signed));
     }
 }

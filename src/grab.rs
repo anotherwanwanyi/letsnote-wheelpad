@@ -24,11 +24,9 @@ impl Grabber {
         if self.grabbed {
             return Ok(());
         }
-        device
-            .grab()
-            .map_err(|e| Error::Grab {
-                source: nix::errno::Errno::from_i32(e.raw_os_error().unwrap_or(0)),
-            })?;
+        device.grab().map_err(|e| Error::Grab {
+            source: nix::errno::Errno::from_i32(e.raw_os_error().unwrap_or(0)),
+        })?;
         self.grabbed = true;
         Ok(())
     }
@@ -39,11 +37,9 @@ impl Grabber {
         if !self.grabbed {
             return Ok(());
         }
-        device
-            .ungrab()
-            .map_err(|e| Error::Grab {
-                source: nix::errno::Errno::from_i32(e.raw_os_error().unwrap_or(0)),
-            })?;
+        device.ungrab().map_err(|e| Error::Grab {
+            source: nix::errno::Errno::from_i32(e.raw_os_error().unwrap_or(0)),
+        })?;
         self.grabbed = false;
         Ok(())
     }

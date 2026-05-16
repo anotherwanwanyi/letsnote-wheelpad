@@ -2,7 +2,6 @@
 // center coordinates, and turns the raw event stream into TouchFrames at
 // each SYN_REPORT. See linux-design.md §5.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use evdev::{AbsoluteAxisType, Device, EventType, InputEvent, Key};
@@ -57,9 +56,9 @@ impl InputDevice {
         // Required capabilities.
         let abs = device.supported_absolute_axes();
         let keys = device.supported_keys();
-        let has_x = abs.map_or(false, |a| a.contains(AbsoluteAxisType::ABS_MT_POSITION_X));
-        let has_y = abs.map_or(false, |a| a.contains(AbsoluteAxisType::ABS_MT_POSITION_Y));
-        let has_touch = keys.map_or(false, |k| k.contains(Key::BTN_TOUCH));
+        let has_x = abs.is_some_and(|a| a.contains(AbsoluteAxisType::ABS_MT_POSITION_X));
+        let has_y = abs.is_some_and(|a| a.contains(AbsoluteAxisType::ABS_MT_POSITION_Y));
+        let has_touch = keys.is_some_and(|k| k.contains(Key::BTN_TOUCH));
         if !has_x {
             return Err(Error::EvdevMissingCap {
                 path: path.to_path_buf(),
@@ -79,7 +78,9 @@ impl InputDevice {
             });
         }
 
-        let abs_state = device.get_abs_state().map_err(|source| Error::EvdevRead { source })?;
+        let abs_state = device
+            .get_abs_state()
+            .map_err(|source| Error::EvdevRead { source })?;
         let xi = abs_state[AbsoluteAxisType::ABS_MT_POSITION_X.0 as usize];
         let yi = abs_state[AbsoluteAxisType::ABS_MT_POSITION_Y.0 as usize];
         let abs_x_min = xi.minimum;
@@ -139,37 +140,28 @@ impl InputDevice {
             .fetch_events()
             .map_err(|source| Error::EvdevRead { source })?
             .collect();
-        let mut saw_syn = false;
         let mut frame_out: Option<TouchFrame> = None;
         for ev in events {
             match ev.event_type() {
                 EventType::ABSOLUTE => self.apply_abs(ev.code(), ev.value()),
-                EventType::KEY => {
-                    if ev.code() == Key::BTN_TOUCH.code() {
-                        self.contact = ev.value() != 0;
-                    }
+                EventType::KEY if ev.code() == Key::BTN_TOUCH.code() => {
+                    self.contact = ev.value() != 0;
                 }
-                EventType::SYNCHRONIZATION => {
-                    if ev.code() == 0 {
-                        // SYN_REPORT
-                        saw_syn = true;
-                        frame_out = Some(self.assemble_frame());
-                    }
+                EventType::SYNCHRONIZATION if ev.code() == 0 => {
+                    // SYN_REPORT
+                    frame_out = Some(self.assemble_frame());
                 }
                 _ => {}
             }
         }
-        let _ = saw_syn;
         Ok(frame_out)
     }
 
     fn apply_abs(&mut self, code: u16, value: i32) {
         let axis = AbsoluteAxisType(code);
         match axis {
-            AbsoluteAxisType::ABS_MT_SLOT => {
-                if (value as usize) < MAX_MT_SLOTS {
-                    self.current_slot = value as usize;
-                }
+            AbsoluteAxisType::ABS_MT_SLOT if (value as usize) < MAX_MT_SLOTS => {
+                self.current_slot = value as usize;
             }
             AbsoluteAxisType::ABS_MT_TRACKING_ID => {
                 let slot = self.current_slot;
@@ -261,13 +253,6 @@ impl InputDevice {
 pub fn history_capacity_for_rate(measured_hz: f64) -> usize {
     let raw = (20.0 * measured_hz / 50.0).round() as i64;
     raw.clamp(10, 100) as usize
-}
-
-// Avoid an unused-import warning when MT_SLOT scratch logic is reduced
-// to a constant probe path.
-#[allow(dead_code)]
-fn _slot_map_static_check() -> BTreeMap<usize, SlotState> {
-    BTreeMap::new()
 }
 
 #[cfg(test)]

@@ -48,15 +48,24 @@ fn full_clockwise_circle_emits_negative_ticks() {
     // scrolls DOWN — matching the worked example in linux-design.md §6.
     let samples = circle_samples(500, 500, 200.0, 0.0, 2.0 * PI, 40);
     let total = run_gesture(&samples, 0);
-    assert!(total < 0, "clockwise circle should produce negative ticks (got {total})");
-    assert!(total.abs() >= 1, "full circle should produce at least one tick");
+    assert!(
+        total < 0,
+        "clockwise circle should produce negative ticks (got {total})"
+    );
+    assert!(
+        total.abs() >= 1,
+        "full circle should produce at least one tick"
+    );
 }
 
 #[test]
 fn full_counterclockwise_circle_emits_positive_ticks() {
     let samples = circle_samples(500, 500, 200.0, 0.0, -2.0 * PI, 40);
     let total = run_gesture(&samples, 0);
-    assert!(total > 0, "counterclockwise circle should produce positive ticks (got {total})");
+    assert!(
+        total > 0,
+        "counterclockwise circle should produce positive ticks (got {total})"
+    );
 }
 
 #[test]
@@ -77,10 +86,26 @@ fn zig_zag_does_not_engage() {
     // truncates history below 3 valid deltas, so step returns 0
     // every packet.
     let zigs: Vec<TouchSample> = [
-        (100, 100), (130, 200), (160, 100), (190, 200), (220, 100),
-        (250, 200), (280, 100), (310, 200), (340, 100), (370, 200),
-        (400, 100), (430, 200), (460, 100), (490, 200), (520, 100),
-        (550, 200), (580, 100), (610, 200), (640, 100), (670, 200),
+        (100, 100),
+        (130, 200),
+        (160, 100),
+        (190, 200),
+        (220, 100),
+        (250, 200),
+        (280, 100),
+        (310, 200),
+        (340, 100),
+        (370, 200),
+        (400, 100),
+        (430, 200),
+        (460, 100),
+        (490, 200),
+        (520, 100),
+        (550, 200),
+        (580, 100),
+        (610, 200),
+        (640, 100),
+        (670, 200),
     ]
     .iter()
     .map(|(x, y)| TouchSample { x: *x, y: *y })
@@ -91,10 +116,7 @@ fn zig_zag_does_not_engage() {
 
 #[test]
 fn half_circle_does_not_exceed_full() {
-    let full = run_gesture(
-        &circle_samples(500, 500, 200.0, 0.0, 2.0 * PI, 40),
-        0,
-    );
+    let full = run_gesture(&circle_samples(500, 500, 200.0, 0.0, 2.0 * PI, 40), 0);
     let half = run_gesture(&circle_samples(500, 500, 200.0, 0.0, PI, 20), 0);
     assert!(full < 0 && half < 0);
     assert!(
@@ -105,14 +127,8 @@ fn half_circle_does_not_exceed_full() {
 
 #[test]
 fn reverse_circle_has_opposite_sign() {
-    let cw = run_gesture(
-        &circle_samples(500, 500, 200.0, 0.0, 2.0 * PI, 40),
-        0,
-    );
-    let ccw = run_gesture(
-        &circle_samples(500, 500, 200.0, 0.0, -2.0 * PI, 40),
-        0,
-    );
+    let cw = run_gesture(&circle_samples(500, 500, 200.0, 0.0, 2.0 * PI, 40), 0);
+    let ccw = run_gesture(&circle_samples(500, 500, 200.0, 0.0, -2.0 * PI, 40), 0);
     assert!(cw < 0 && ccw > 0, "cw={cw} ccw={ccw}");
 }
 
@@ -173,8 +189,8 @@ fn radial_gate_default_width_requires_outer_ring() {
     // DetectAreaWidth = 0 → r ≥ 200 units from center.
     assert!(!radial_gate_ok(500, 500, TouchSample { x: 500, y: 500 }, 0));
     assert!(!radial_gate_ok(500, 500, TouchSample { x: 600, y: 500 }, 0)); // r = 100
-    assert!(radial_gate_ok(500, 500, TouchSample { x: 700, y: 500 }, 0));  // r = 200
-    assert!(radial_gate_ok(500, 500, TouchSample { x: 800, y: 500 }, 0));  // r = 300
+    assert!(radial_gate_ok(500, 500, TouchSample { x: 700, y: 500 }, 0)); // r = 200
+    assert!(radial_gate_ok(500, 500, TouchSample { x: 800, y: 500 }, 0)); // r = 300
 }
 
 #[test]

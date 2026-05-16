@@ -183,7 +183,12 @@ pub fn engagement_swept_angle(
 /// Radial gate from FUN_140005a00 line 31 and FUN_1400046a0 lines 129/187.
 /// Returns true if the centered sample is in the outer ring (i.e., outside
 /// the inner dead-zone radius).
-pub fn radial_gate_ok(center_x: i32, center_y: i32, s: TouchSample, detect_area_width: i32) -> bool {
+pub fn radial_gate_ok(
+    center_x: i32,
+    center_y: i32,
+    s: TouchSample,
+    detect_area_width: i32,
+) -> bool {
     let dx = (s.x - center_x) as i64;
     let dy = (s.y - center_y) as i64;
     let r2 = dx * dx + dy * dy;

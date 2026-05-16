@@ -39,7 +39,12 @@ impl UinputDevice {
         let dev = VirtualDeviceBuilder::new()
             .map_err(|source| Error::UinputCreate { source })?
             .name(DEVICE_NAME)
-            .input_id(InputId::new(BusType::BUS_VIRTUAL, VENDOR_ID, PRODUCT_ID, VERSION))
+            .input_id(InputId::new(
+                BusType::BUS_VIRTUAL,
+                VENDOR_ID,
+                PRODUCT_ID,
+                VERSION,
+            ))
             .with_relative_axes(&rel)
             .map_err(|source| Error::UinputCreate { source })?
             .build()
@@ -57,7 +62,11 @@ impl UinputDevice {
             return Ok(());
         }
         let events = [
-            InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_WHEEL_HI_RES.0, ticks * HI_RES_STEP),
+            InputEvent::new(
+                EventType::RELATIVE,
+                RelativeAxisType::REL_WHEEL_HI_RES.0,
+                ticks * HI_RES_STEP,
+            ),
             InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_WHEEL.0, ticks),
         ];
         self.dev
@@ -71,7 +80,11 @@ impl UinputDevice {
             return Ok(());
         }
         let events = [
-            InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_HWHEEL_HI_RES.0, ticks * HI_RES_STEP),
+            InputEvent::new(
+                EventType::RELATIVE,
+                RelativeAxisType::REL_HWHEEL_HI_RES.0,
+                ticks * HI_RES_STEP,
+            ),
             InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_HWHEEL.0, ticks),
         ];
         self.dev
