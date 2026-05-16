@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+# Reload udev so the rule takes effect for currently plugged-in devices.
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || true
+    udevadm trigger || true
+fi
+
+# Make sure the uinput module is loaded now (modules-load.d only acts at
+# boot).
+if [ -e /proc/modules ] && ! grep -q '^uinput ' /proc/modules; then
+    modprobe uinput || true
+fi
+
+# Enable the user service for all users at next login. (Per-user
+# enabling: `systemctl --user enable --now letsnote-wheelpad`.)
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --global enable letsnote-wheelpad.service || true
+fi
+
+exit 0

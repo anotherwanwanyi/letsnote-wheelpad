@@ -1,0 +1,222 @@
+// FSM synthetic tests — see linux-design.md §13.
+
+use std::f64::consts::PI;
+
+use letsnote_wheelpad::config::Scroll;
+use letsnote_wheelpad::detector::{CircularDetector, TouchSample};
+use letsnote_wheelpad::fsm::{Action, Fsm, FsmState, TouchFrame};
+
+fn default_scroll() -> Scroll {
+    Scroll::default()
+}
+
+fn lift() -> TouchFrame {
+    TouchFrame {
+        contact: false,
+        pos: None,
+    }
+}
+
+fn touch(x: i32, y: i32) -> TouchFrame {
+    TouchFrame {
+        contact: true,
+        pos: Some(TouchSample { x, y }),
+    }
+}
+
+fn drive(
+    fsm: &mut Fsm,
+    detector: &mut CircularDetector,
+    scroll: &Scroll,
+    frames: &[TouchFrame],
+) -> Vec<Action> {
+    let mut acc = Vec::new();
+    for f in frames {
+        let actions = fsm.step(*f, detector, scroll);
+        for a in actions.iter().copied() {
+            if !matches!(a, Action::None) {
+                acc.push(a);
+            }
+        }
+    }
+    acc
+}
+
+#[test]
+fn idle_to_contact_on_touchdown_inside_dead_zone() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+    let _ = drive(&mut fsm, &mut det, &scroll, &[touch(510, 510)]);
+    assert!(matches!(fsm.state(), FsmState::Contact { .. }));
+}
+
+#[test]
+fn idle_to_moving_on_touchdown_outside_dead_zone() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+    let _ = drive(&mut fsm, &mut det, &scroll, &[touch(720, 500)]); // r = 220
+    assert!(matches!(fsm.state(), FsmState::Moving { .. }));
+}
+
+#[test]
+fn contact_to_idle_on_lift() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+    drive(&mut fsm, &mut det, &scroll, &[touch(510, 510), lift()]);
+    assert!(matches!(fsm.state(), FsmState::Idle));
+}
+
+#[test]
+fn contact_does_not_engage_on_cross_gate_movement_d020() {
+    // D-020: strict Windows dead-zone semantics. Once trapped in
+    // Contact, even sliding outside the gate does not engage Moving.
+    // The user must lift and re-touch.
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+    // Touch inside dead zone, then slide outside.
+    drive(
+        &mut fsm,
+        &mut det,
+        &scroll,
+        &[touch(510, 510), touch(550, 500), touch(720, 500)],
+    );
+    assert!(
+        matches!(fsm.state(), FsmState::Contact { .. }),
+        "expected to stay in Contact, got {:?}",
+        fsm.state()
+    );
+}
+
+#[test]
+fn moving_to_idle_on_lift_before_engagement() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+    drive(&mut fsm, &mut det, &scroll, &[touch(720, 500), lift()]);
+    assert!(matches!(fsm.state(), FsmState::Idle));
+}
+
+#[test]
+fn moving_to_contact_on_slip_back_into_dead_zone() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+    // Engage outside, then slip back inside.
+    drive(
+        &mut fsm,
+        &mut det,
+        &scroll,
+        &[touch(720, 500), touch(550, 500)],
+    );
+    assert!(matches!(fsm.state(), FsmState::Contact { .. }));
+}
+
+#[test]
+fn moving_to_scrolling_on_swept_angle_past_trigger() {
+    // Sweep > π/12 from engage_start while staying outside the radial
+    // gate → Scrolling. Verify the grab action fires.
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+
+    // engage_start at angle 0, r=220
+    let start = touch(720, 500);
+    // sweep to angle π/8 (= 22.5°, > π/12 = 15°), r=220
+    let theta = PI / 8.0;
+    let end_x = 500 + (220.0 * theta.cos()).round() as i32;
+    let end_y = 500 + (220.0 * theta.sin()).round() as i32;
+    let end = touch(end_x, end_y);
+
+    let actions = drive(&mut fsm, &mut det, &scroll, &[start, end]);
+    assert!(matches!(fsm.state(), FsmState::Scrolling));
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::GrabPhysical)),
+        "expected GrabPhysical, got {:?}",
+        actions
+    );
+}
+
+#[test]
+fn scrolling_to_debounce_on_lift_with_release_action() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+
+    let start = touch(720, 500);
+    let theta = PI / 8.0;
+    let mid_x = 500 + (220.0 * theta.cos()).round() as i32;
+    let mid_y = 500 + (220.0 * theta.sin()).round() as i32;
+    let mid = touch(mid_x, mid_y);
+
+    drive(&mut fsm, &mut det, &scroll, &[start, mid]);
+    assert!(matches!(fsm.state(), FsmState::Scrolling));
+
+    let actions = drive(&mut fsm, &mut det, &scroll, &[lift()]);
+    assert!(matches!(fsm.state(), FsmState::Debounce));
+    assert!(actions.iter().any(|a| matches!(a, Action::ReleasePhysical)));
+}
+
+#[test]
+fn debounce_to_idle_on_next_frame_no_timer() {
+    // D-011-followup: Debounce always exits to Idle on the next frame
+    // regardless of whether the finger is now down or up.
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+
+    let start = touch(720, 500);
+    let theta = PI / 8.0;
+    let mid_x = 500 + (220.0 * theta.cos()).round() as i32;
+    let mid_y = 500 + (220.0 * theta.sin()).round() as i32;
+    let mid = touch(mid_x, mid_y);
+
+    drive(&mut fsm, &mut det, &scroll, &[start, mid, lift()]);
+    assert!(matches!(fsm.state(), FsmState::Debounce));
+
+    drive(&mut fsm, &mut det, &scroll, &[lift()]);
+    assert!(matches!(fsm.state(), FsmState::Idle));
+}
+
+#[test]
+fn debounce_to_idle_even_if_finger_back_down() {
+    // Per D-011-followup, the Debounce state has no re-engagement
+    // path. If a finger is down on the very next frame, we still go to
+    // Idle this frame; the frame *after* that re-runs the fresh-touch
+    // classifier.
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let scroll = default_scroll();
+
+    let start = touch(720, 500);
+    let theta = PI / 8.0;
+    let mid_x = 500 + (220.0 * theta.cos()).round() as i32;
+    let mid_y = 500 + (220.0 * theta.sin()).round() as i32;
+    let mid = touch(mid_x, mid_y);
+
+    drive(&mut fsm, &mut det, &scroll, &[start, mid, lift()]);
+    assert!(matches!(fsm.state(), FsmState::Debounce));
+
+    drive(&mut fsm, &mut det, &scroll, &[touch(720, 500)]);
+    assert!(matches!(fsm.state(), FsmState::Idle));
+}
+
+#[test]
+fn disabled_scroll_holds_idle() {
+    // D-007: when scroll.enable = false the daemon keeps reading
+    // frames but the FSM never advances past Idle.
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new(20);
+    let mut scroll = default_scroll();
+    scroll.enable = false;
+    drive(
+        &mut fsm,
+        &mut det,
+        &scroll,
+        &[touch(720, 500), touch(700, 520), lift()],
+    );
+    assert!(matches!(fsm.state(), FsmState::Idle));
+}

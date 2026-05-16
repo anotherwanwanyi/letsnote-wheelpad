@@ -1,0 +1,11 @@
+# Let's Note WheelPad — grant access to the Synaptics TM3562-3 touchpad
+# and to /dev/uinput so the per-user daemon can read raw touch events
+# and create a virtual wheel device.
+#
+# `TAG+="uaccess"` grants read/write to the currently active local user
+# via systemd-logind; the `input` group fallback covers headless setups.
+
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*TM3562*", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"

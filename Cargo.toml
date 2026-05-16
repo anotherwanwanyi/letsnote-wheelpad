@@ -1,0 +1,84 @@
+[package]
+name = "letsnote-wheelpad"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Userland daemon that ports Panasonic Let's Note WheelPad (circular touchpad scroll) to Linux"
+license = "MIT"
+repository = "https://github.com/yourname/letsnote-wheelpad"
+readme = "README.md"
+keywords = ["touchpad", "uinput", "letsnote", "wheelpad", "scroll"]
+categories = ["hardware-support", "command-line-utilities"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+evdev = "=0.12.2"
+nix = { version = "0.27", features = ["ioctl", "fs", "signal", "poll"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "1"
+libc = "0.2"
+regex = "1"
+libsystemd = "0.7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# ---------------------------------------------------------------------------
+# cargo-deb metadata (Ubuntu / Debian package)
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+maintainer = "Let's Note WheelPad maintainers"
+copyright = "2026, Let's Note WheelPad maintainers"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Userland daemon that reproduces the Panasonic Let's Note WheelPad circular
+touchpad scrolling behaviour on Linux by reading evdev events from the
+physical Synaptics touchpad and emitting wheel events via a uinput virtual
+device. Works on Wayland and X11."""
+section = "utils"
+priority = "optional"
+depends = "$auto, systemd, udev"
+maintainer-scripts = "packaging/deb"
+assets = [
+    ["target/release/letsnote-wheelpad", "usr/bin/", "755"],
+    ["packaging/udev/70-letsnote-wheelpad.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/systemd/letsnote-wheelpad.service", "usr/lib/systemd/user/", "644"],
+    ["packaging/modules-load/letsnote-wheelpad.conf", "usr/lib/modules-load.d/", "644"],
+    ["README.md", "usr/share/doc/letsnote-wheelpad/README.md", "644"],
+    ["README.ja.md", "usr/share/doc/letsnote-wheelpad/README.ja.md", "644"],
+    ["LICENSE", "usr/share/doc/letsnote-wheelpad/LICENSE", "644"],
+]
+
+# ---------------------------------------------------------------------------
+# cargo-generate-rpm metadata (Fedora / RHEL package)
+# ---------------------------------------------------------------------------
+[package.metadata.generate-rpm]
+license = "MIT"
+summary = "Let's Note WheelPad circular touchpad scroll daemon"
+assets = [
+    { source = "target/release/letsnote-wheelpad", dest = "/usr/bin/letsnote-wheelpad", mode = "755" },
+    { source = "packaging/udev/70-letsnote-wheelpad.rules", dest = "/usr/lib/udev/rules.d/70-letsnote-wheelpad.rules", mode = "644" },
+    { source = "packaging/systemd/letsnote-wheelpad.service", dest = "/usr/lib/systemd/user/letsnote-wheelpad.service", mode = "644" },
+    { source = "packaging/modules-load/letsnote-wheelpad.conf", dest = "/usr/lib/modules-load.d/letsnote-wheelpad.conf", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/letsnote-wheelpad/README.md", mode = "644", doc = true },
+    { source = "README.ja.md", dest = "/usr/share/doc/letsnote-wheelpad/README.ja.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/letsnote-wheelpad/LICENSE", mode = "644", doc = true },
+]
+post_install_script = """
+udevadm control --reload-rules || true
+udevadm trigger || true
+systemctl daemon-reload || true
+"""
+pre_uninstall_script = """
+true
+"""
