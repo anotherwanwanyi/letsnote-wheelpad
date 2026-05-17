@@ -17,8 +17,9 @@ use std::path::Path;
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
     AbsInfo, AbsoluteAxisType, AttributeSet, BusType, Device, EventType, InputEvent, InputId,
-    RelativeAxisType, UinputAbsSetup,
+    PropType, RelativeAxisType, UinputAbsSetup,
 };
+use tracing::warn;
 
 use crate::error::{Error, Result};
 
@@ -187,11 +188,28 @@ impl UinputTouchpad {
                 .map_err(|source| Error::UinputCreate { source })?;
         }
 
-        // Mirror INPUT_PROP_* properties. INPUT_PROP_POINTER and
-        // INPUT_PROP_BUTTONPAD are essential for libinput to classify
-        // the virtual device as a touchpad.
+        // Mirror INPUT_PROP_* properties EXCEPT INPUT_PROP_SEMI_MT.
+        // INPUT_PROP_POINTER and INPUT_PROP_BUTTONPAD are essential
+        // for libinput to classify the virtual device as a touchpad
+        // and a clickpad respectively — we want to keep those.
+        // SEMI_MT advertises legacy semi-multi-touch, which makes
+        // libinput downgrade multi-finger gesture handling; even if
+        // the physical pad reports it (some older Synaptics firmware
+        // does), our virtual pad delivers the events libinput's
+        // full-MT path expects, so SEMI_MT only confuses things.
+        let mut filtered_props = AttributeSet::<PropType>::new();
+        for prop in physical.properties().iter() {
+            if prop == PropType::SEMI_MT {
+                warn!(
+                    "filtering INPUT_PROP_SEMI_MT from virtual touchpad \
+                     (would degrade libinput multi-finger handling)"
+                );
+                continue;
+            }
+            filtered_props.insert(prop);
+        }
         builder = builder
-            .with_properties(physical.properties())
+            .with_properties(&filtered_props)
             .map_err(|source| Error::UinputCreate { source })?;
 
         let dev = builder
