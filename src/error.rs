@@ -44,7 +44,7 @@ pub enum Error {
     UinputWrite { source: io::Error },
 
     #[error("EVIOCGRAB ioctl failed: {source}")]
-    Grab { source: nix::errno::Errno },
+    Grab { source: io::Error },
 
     #[error("invalid device-name regex `{pattern}`: {source}")]
     RegexInvalid {

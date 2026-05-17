@@ -55,6 +55,18 @@ pub struct PhysicalFrame {
     pub events: Vec<InputEvent>,
 }
 
+impl Drop for InputDevice {
+    /// Panic-safe ungrab. The kernel releases EVIOCGRAB on FD close
+    /// regardless, but explicitly calling ungrab here means the
+    /// release happens deterministically during unwind, before the
+    /// FD's file struct is reaped — closing the race where a daemon
+    /// restart tries to re-grab before the kernel has finalized the
+    /// old FD.
+    fn drop(&mut self) {
+        let _ = self.device.ungrab();
+    }
+}
+
 impl InputDevice {
     /// Open the device at `path` and validate required capabilities.
     pub fn open(path: &Path) -> Result<Self> {
@@ -119,6 +131,15 @@ impl InputDevice {
             contact: false,
             dirty: 0,
         })
+    }
+
+    /// Release any active EVIOCGRAB. Idempotent — calling on an
+    /// ungrabbed device returns Ok. Wraps evdev's `ungrab` so the
+    /// caller doesn't have to convert io::Error.
+    pub fn ungrab(&mut self) -> Result<()> {
+        self.device
+            .ungrab()
+            .map_err(|source| Error::Grab { source })
     }
 
     /// Find a touchpad whose name matches `regex`. Returns the first match

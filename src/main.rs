@@ -91,9 +91,10 @@ fn run(args: Args) -> Result<()> {
     //    through our virtual touchpad. Releasing the grab is handled
     //    by `Drop` on `input.device` (and by the panic-safety cleanup
     //    after the main loop returns).
-    input.device.grab().map_err(|e| Error::Grab {
-        source: nix::errno::Errno::from_i32(e.raw_os_error().unwrap_or(0)),
-    })?;
+    input
+        .device
+        .grab()
+        .map_err(|source| Error::Grab { source })?;
     info!("physical touchpad grabbed (passthrough mode)");
 
     // 5. Notify systemd we're ready.
@@ -211,8 +212,10 @@ fn run(args: Args) -> Result<()> {
     }
 
     info!("shutting down");
-    // Ungrab so the next daemon launch can read the device.
-    let _ = input.device.ungrab();
+    // Explicit ungrab here is belt-and-suspenders — `Drop` on
+    // `InputDevice` does it too, but doing it before tracing's final
+    // flush keeps the order obvious in journal logs.
+    let _ = input.ungrab();
     Ok(())
 }
 
