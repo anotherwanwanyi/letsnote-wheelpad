@@ -212,10 +212,7 @@ fn run(args: Args) -> Result<()> {
     }
 
     info!("shutting down");
-    // Explicit ungrab here is belt-and-suspenders — `Drop` on
-    // `InputDevice` does it too, but doing it before tracing's final
-    // flush keeps the order obvious in journal logs.
-    let _ = input.ungrab();
+    // `Drop for InputDevice` releases EVIOCGRAB.
     Ok(())
 }
 

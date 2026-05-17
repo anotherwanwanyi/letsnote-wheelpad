@@ -72,34 +72,34 @@ impl UinputWheel {
     /// `reverse_vertical` flipping; this function does not interpret
     /// signs further.
     pub fn emit_v(&mut self, ticks: i32) -> Result<()> {
-        if ticks == 0 {
-            return Ok(());
-        }
-        let events = [
-            InputEvent::new(
-                EventType::RELATIVE,
-                RelativeAxisType::REL_WHEEL_HI_RES.0,
-                ticks * HI_RES_STEP,
-            ),
-            InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_WHEEL.0, ticks),
-        ];
-        self.dev
-            .emit(&events)
-            .map_err(|source| Error::UinputWrite { source })
+        self.emit_axis(
+            ticks,
+            RelativeAxisType::REL_WHEEL,
+            RelativeAxisType::REL_WHEEL_HI_RES,
+        )
     }
 
     /// Emit `ticks` horizontal wheel notches. Positive = scroll right.
     pub fn emit_h(&mut self, ticks: i32) -> Result<()> {
+        self.emit_axis(
+            ticks,
+            RelativeAxisType::REL_HWHEEL,
+            RelativeAxisType::REL_HWHEEL_HI_RES,
+        )
+    }
+
+    fn emit_axis(
+        &mut self,
+        ticks: i32,
+        axis: RelativeAxisType,
+        axis_hi_res: RelativeAxisType,
+    ) -> Result<()> {
         if ticks == 0 {
             return Ok(());
         }
         let events = [
-            InputEvent::new(
-                EventType::RELATIVE,
-                RelativeAxisType::REL_HWHEEL_HI_RES.0,
-                ticks * HI_RES_STEP,
-            ),
-            InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_HWHEEL.0, ticks),
+            InputEvent::new(EventType::RELATIVE, axis_hi_res.0, ticks * HI_RES_STEP),
+            InputEvent::new(EventType::RELATIVE, axis.0, ticks),
         ];
         self.dev
             .emit(&events)

@@ -18,7 +18,6 @@ const MAX_MT_SLOTS: usize = 16;
 
 pub struct InputDevice {
     pub device: Device,
-    pub path: PathBuf,
     pub abs_x_min: i32,
     pub abs_x_max: i32,
     pub abs_y_min: i32,
@@ -31,13 +30,9 @@ pub struct InputDevice {
     current_slot: usize,
     /// BTN_TOUCH summary; mirrors the kernel-reported any-finger-down state.
     contact: bool,
-    /// Per-frame "dirty" markers for slots that received any update in the
-    /// current SYN_REPORT window — used to honour the "lowest active slot"
-    /// rule once events are flushed.
-    dirty: u16,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct SlotState {
     /// `-1` means inactive (kernel convention).
     tracking_id: i32,
@@ -112,14 +107,14 @@ impl InputDevice {
         let center_x = (abs_x_min + abs_x_max) / 2;
         let center_y = (abs_y_min + abs_y_max) / 2;
 
-        let mut slots = [SlotState::default(); MAX_MT_SLOTS];
-        for s in slots.iter_mut() {
-            s.tracking_id = -1;
-        }
+        let slots = [SlotState {
+            tracking_id: -1,
+            x: 0,
+            y: 0,
+        }; MAX_MT_SLOTS];
 
         Ok(Self {
             device,
-            path: path.to_path_buf(),
             abs_x_min,
             abs_x_max,
             abs_y_min,
@@ -129,17 +124,7 @@ impl InputDevice {
             slots,
             current_slot: 0,
             contact: false,
-            dirty: 0,
         })
-    }
-
-    /// Release any active EVIOCGRAB. Idempotent — calling on an
-    /// ungrabbed device returns Ok. Wraps evdev's `ungrab` so the
-    /// caller doesn't have to convert io::Error.
-    pub fn ungrab(&mut self) -> Result<()> {
-        self.device
-            .ungrab()
-            .map_err(|source| Error::Grab { source })
     }
 
     /// Find a touchpad whose name matches `regex`. Returns the first match
@@ -213,21 +198,18 @@ impl InputDevice {
                 let slot = self.current_slot;
                 if slot < MAX_MT_SLOTS {
                     self.slots[slot].tracking_id = value;
-                    self.dirty |= 1u16 << slot;
                 }
             }
             AbsoluteAxisType::ABS_MT_POSITION_X => {
                 let slot = self.current_slot;
                 if slot < MAX_MT_SLOTS {
                     self.slots[slot].x = value;
-                    self.dirty |= 1u16 << slot;
                 }
             }
             AbsoluteAxisType::ABS_MT_POSITION_Y => {
                 let slot = self.current_slot;
                 if slot < MAX_MT_SLOTS {
                     self.slots[slot].y = value;
-                    self.dirty |= 1u16 << slot;
                 }
             }
             // Some pads also expose ABS_X / ABS_Y for the primary touch.
@@ -237,7 +219,6 @@ impl InputDevice {
     }
 
     fn assemble_frame(&mut self) -> TouchFrame {
-        self.dirty = 0;
         // Lowest-numbered active slot wins (D-012). "Active" = tracking_id != -1.
         let chosen = self
             .slots
