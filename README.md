@@ -6,10 +6,6 @@ A userland Linux daemon that reproduces the **Panasonic Let's Note "WheelPad"** 
 
 Works on Wayland and X11 by reading evdev events directly from the physical Synaptics touchpad and emitting wheel events through a `uinput` virtual device. The physical pad keeps driving the cursor as normal; this daemon contributes scroll only.
 
-## Status
-
-**v0.1.0 — first release.** Ported from reverse-engineered `WheelPad.exe` on Windows. Algorithm verified against the Ghidra-decompiled originals; defaults match the Windows out-of-box behaviour. Tested target: **Panasonic Let's Note CF-SV2 with Synaptics TM3562-3** on Ubuntu 26.04.
-
 ## Why this exists
 
 `libinput` rejected adding circular scrolling to the Wayland-era stack (see Peter Hutterer's 2015 reasoning). So if you want your Let's Note's circular scroll to work on Linux, the only path is a userland daemon that reads the touchpad through evdev and emits wheel events through a separate virtual device. That's what this is.
