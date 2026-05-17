@@ -11,6 +11,13 @@ pub const ZONE_RADIANS: f64 = PI / 8.0;
 pub const SAMPLE_DEADBAND_SQ: i64 = 400;
 pub const SENSITIVITY_TABLE: [i32; 5] = [10, 14, 20, 28, 40];
 
+/// Fixed at 20 to match Windows WheelPad exactly (DAT_14003cbec clamp at
+/// FUN_1400046a0 lines 65-67). The earlier design (D-021) scaled this
+/// from a startup-measured packet rate; hardware testing on the CF-SV2
+/// showed that scaling subtly changed scrolling startup feel, so we
+/// revert to Windows-faithful behaviour. See DECISIONS.md D-021-followup.
+pub const HISTORY_CAPACITY: usize = 20;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TouchSample {
     pub x: i32,
@@ -19,16 +26,20 @@ pub struct TouchSample {
 
 pub struct CircularDetector {
     history: VecDeque<TouchSample>,
-    history_capacity: usize,
     last_stored: Option<TouchSample>,
     accumulator: f64,
 }
 
+impl Default for CircularDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CircularDetector {
-    pub fn new(history_capacity: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            history: VecDeque::with_capacity(history_capacity),
-            history_capacity,
+            history: VecDeque::with_capacity(HISTORY_CAPACITY),
             last_stored: None,
             accumulator: 0.0,
         }
@@ -52,7 +63,7 @@ impl CircularDetector {
             }
         }
         self.last_stored = Some(s);
-        if self.history.len() == self.history_capacity {
+        if self.history.len() == HISTORY_CAPACITY {
             self.history.pop_back();
         }
         self.history.push_front(s);

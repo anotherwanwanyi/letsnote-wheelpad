@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 use letsnote_wheelpad::config::Config;
 use letsnote_wheelpad::detector::CircularDetector;
 use letsnote_wheelpad::error::{Error, Result};
-use letsnote_wheelpad::evdev::{history_capacity_for_rate, InputDevice};
+use letsnote_wheelpad::evdev::InputDevice;
 use letsnote_wheelpad::fsm::{Action, Fsm};
 use letsnote_wheelpad::grab::Grabber;
 use letsnote_wheelpad::uinput::UinputDevice;
@@ -87,28 +87,9 @@ fn run(args: Args) -> Result<()> {
         warn!("sd_notify Ready failed (acceptable outside systemd): {e}");
     }
 
-    // 4. Measure the evdev packet rate over the first second and pick
-    //    the history capacity (D-021). If measurement times out (no
-    //    motion within the window) we fall back to the Windows default.
-    let measured = input.measure_rate(50, Duration::from_secs(1));
-    let capacity = match measured {
-        Some(hz) => {
-            let cap = history_capacity_for_rate(hz);
-            info!(
-                rate_hz = format!("{:.1}", hz),
-                history_capacity = cap,
-                "evdev rate measured"
-            );
-            cap
-        }
-        None => {
-            info!("evdev rate measurement timed out; using Windows default (20)");
-            20
-        }
-    };
-
-    // 5. Build the algorithm and FSM.
-    let mut detector = CircularDetector::new(capacity);
+    // 4. Build the algorithm and FSM. History capacity is fixed at 20
+    //    to match Windows WheelPad exactly (D-021-followup).
+    let mut detector = CircularDetector::new();
     let mut fsm = Fsm::new(input.center_x, input.center_y);
     let mut grabber = Grabber::new();
 

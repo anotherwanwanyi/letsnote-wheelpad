@@ -45,7 +45,7 @@ fn drive(
 #[test]
 fn idle_to_contact_on_touchdown_inside_dead_zone() {
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
     let _ = drive(&mut fsm, &mut det, &scroll, &[touch(510, 510)]);
     assert!(matches!(fsm.state(), FsmState::Contact { .. }));
@@ -54,7 +54,7 @@ fn idle_to_contact_on_touchdown_inside_dead_zone() {
 #[test]
 fn idle_to_moving_on_touchdown_outside_dead_zone() {
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
     let _ = drive(&mut fsm, &mut det, &scroll, &[touch(720, 500)]); // r = 220
     assert!(matches!(fsm.state(), FsmState::Moving { .. }));
@@ -63,7 +63,7 @@ fn idle_to_moving_on_touchdown_outside_dead_zone() {
 #[test]
 fn contact_to_idle_on_lift() {
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
     drive(&mut fsm, &mut det, &scroll, &[touch(510, 510), lift()]);
     assert!(matches!(fsm.state(), FsmState::Idle));
@@ -75,7 +75,7 @@ fn contact_does_not_engage_on_cross_gate_movement_d020() {
     // Contact, even sliding outside the gate does not engage Moving.
     // The user must lift and re-touch.
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
     // Touch inside dead zone, then slide outside.
     drive(
@@ -94,7 +94,7 @@ fn contact_does_not_engage_on_cross_gate_movement_d020() {
 #[test]
 fn moving_to_idle_on_lift_before_engagement() {
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
     drive(&mut fsm, &mut det, &scroll, &[touch(720, 500), lift()]);
     assert!(matches!(fsm.state(), FsmState::Idle));
@@ -103,7 +103,7 @@ fn moving_to_idle_on_lift_before_engagement() {
 #[test]
 fn moving_to_contact_on_slip_back_into_dead_zone() {
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
     // Engage outside, then slip back inside.
     drive(
@@ -120,7 +120,7 @@ fn moving_to_scrolling_on_swept_angle_past_trigger() {
     // Sweep > π/12 from engage_start while staying outside the radial
     // gate → Scrolling. Verify the grab action fires.
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
 
     // engage_start at angle 0, r=220
@@ -143,7 +143,7 @@ fn moving_to_scrolling_on_swept_angle_past_trigger() {
 #[test]
 fn scrolling_to_debounce_on_lift_with_release_action() {
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
 
     let start = touch(720, 500);
@@ -165,7 +165,7 @@ fn debounce_to_idle_on_next_frame_no_timer() {
     // D-011-followup: Debounce always exits to Idle on the next frame
     // regardless of whether the finger is now down or up.
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
 
     let start = touch(720, 500);
@@ -188,7 +188,7 @@ fn debounce_to_idle_even_if_finger_back_down() {
     // Idle this frame; the frame *after* that re-runs the fresh-touch
     // classifier.
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let scroll = default_scroll();
 
     let start = touch(720, 500);
@@ -209,7 +209,7 @@ fn disabled_scroll_holds_idle() {
     // D-007: when scroll.enable = false the daemon keeps reading
     // frames but the FSM never advances past Idle.
     let mut fsm = Fsm::new(500, 500);
-    let mut det = CircularDetector::new(20);
+    let mut det = CircularDetector::new();
     let mut scroll = default_scroll();
     scroll.enable = false;
     drive(

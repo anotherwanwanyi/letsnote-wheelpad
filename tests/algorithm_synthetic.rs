@@ -30,7 +30,7 @@ fn circle_samples(
 }
 
 fn run_gesture(samples: &[TouchSample], sensitivity: i32) -> i32 {
-    let mut d = CircularDetector::new(20);
+    let mut d = CircularDetector::new();
     d.on_gesture_start();
     let mut total = 0_i32;
     for s in samples {
@@ -138,7 +138,7 @@ fn sign_convention_positive_overflow_yields_negative_tick() {
     // verify a subsequent step drains negative. This sidesteps any
     // dependence on real gesture geometry; it directly exercises the
     // emit branch.
-    let mut d = CircularDetector::new(20);
+    let mut d = CircularDetector::new();
     d.on_gesture_start();
     for s in circle_samples(500, 500, 200.0, 0.0, 0.5, 5) {
         d.push_if_moved(s);
