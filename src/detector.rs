@@ -137,22 +137,10 @@ impl CircularDetector {
         ticks
     }
 
-    /// Test-only inspector. Visible to integration tests under `tests/`.
-    #[doc(hidden)]
-    pub fn accumulator_for_test(&self) -> f64 {
-        self.accumulator
-    }
-
     /// Test-only setter. Visible to integration tests under `tests/`.
     #[doc(hidden)]
     pub fn set_accumulator_for_test(&mut self, v: f64) {
         self.accumulator = v;
-    }
-
-    /// Test-only inspector.
-    #[doc(hidden)]
-    pub fn history_len(&self) -> usize {
-        self.history.len()
     }
 }
 

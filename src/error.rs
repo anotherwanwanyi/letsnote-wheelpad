@@ -52,9 +52,6 @@ pub enum Error {
         source: regex::Error,
     },
 
-    #[error("systemd notify failed: {source}")]
-    SdNotify { source: io::Error },
-
     #[error("signal handling setup failed: {source}")]
     Signal { source: nix::errno::Errno },
 }
