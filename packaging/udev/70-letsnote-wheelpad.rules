@@ -8,4 +8,5 @@
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*TM3562*", \
     MODE="0660", GROUP="input", TAG+="uaccess"
 
-KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+KERNEL=="uinput", MODE="0660", GROUP="input", \
+    TAG+="uaccess", OPTIONS+="static_node=uinput"
