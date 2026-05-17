@@ -93,7 +93,7 @@ level = "info"  # trace | debug | info | warn | error
 journalctl --user -u letsnote-wheelpad -f
 ```
 
-The first second of operation logs the measured packet rate and the chosen history capacity (which scales with rate per [D-021](../DECISIONS.md)). If scrolling feels too fast or too slow, that's the first place to look.
+If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the config (-2..+2). The daemon does not auto-calibrate — history capacity is fixed at 20 slots to match Windows exactly (see DECISIONS.md D-021-followup).
 
 ## Known issues / non-goals
 
@@ -104,9 +104,9 @@ The first second of operation logs the measured packet rate and the chosen histo
 
 ## How it works (one-paragraph version)
 
-The daemon opens `/dev/input/eventN` (the physical touchpad) and watches multi-touch packets. A 6-state FSM (`Idle → Contact → Moving → Scrolling → Debounce`) decides when a finger is drawing a circle in the outer ring. While `Scrolling`, the daemon grabs the physical device with `EVIOCGRAB` (suspending the cursor-driving path so circles don't drag the pointer around) and integrates chord-direction angles into an accumulator. Every time the accumulator crosses ±π, the daemon emits one wheel notch on a separate `uinput` virtual device. On finger lift, the grab is released.
+The daemon takes exclusive ownership of the physical touchpad at startup (`EVIOCGRAB`, held forever) and creates two virtual `uinput` devices that libinput attaches to instead: a touchpad mirror (same capabilities as the physical pad) and a wheel. All physical touch events are forwarded verbatim to the virtual touchpad — so cursor, taps, clicks, and multi-finger gestures keep working exactly as before. When a 6-state FSM (`Idle → Contact → Moving → Scrolling → Debounce`) decides a finger is drawing a circle in the outer ring, we **suppress** the forwarding for that gesture's duration (cursor freezes, as desired) and integrate chord-direction angles into an accumulator. Each ±π crossing emits one wheel notch on the virtual wheel. When the finger lifts, we forward the lift event (with position stripped) so libinput sees a clean end-of-gesture without a synthetic cursor jump.
 
-For the full algorithm details — including the reverse-engineering trail that motivated the Linux design — see the analysis docs that ship alongside the source.
+For the full algorithm details and the architectural pivot history — see `DECISIONS.md` (D-022 is the passthrough decision; D-008..D-021 are the algorithm choices) and the analysis docs alongside the source.
 
 ## License
 
