@@ -111,12 +111,15 @@ fn run(args: Args) -> Result<()> {
 
     // 8. Main loop.
     let raw_fd = input.device.as_raw_fd();
-    let mut scrolling_since: Option<Instant> = None;
+    let mut last_packet_at = Instant::now();
 
     while !STOP.load(Ordering::Relaxed) {
-        // While scrolling, cap the wait so the watchdog can fire.
+        // While scrolling, cap the wait so the watchdog can fire when
+        // packet flow truly stalls (not when a long deliberate scroll
+        // is in progress — last_packet_at is reset on every frame).
         let timeout_ms: i32 = if matches!(fsm.state(), FsmState::Scrolling) {
-            SCROLLING_WATCHDOG.as_millis() as i32
+            let remaining = SCROLLING_WATCHDOG.saturating_sub(last_packet_at.elapsed());
+            remaining.as_millis() as i32
         } else {
             -1
         };
@@ -135,18 +138,19 @@ fn run(args: Args) -> Result<()> {
         };
 
         if n == 0 {
-            // Timeout. Only meaningful while scrolling.
-            if matches!(fsm.state(), FsmState::Scrolling) {
+            // Timeout. Watchdog fires only if we've been stuck in
+            // Scrolling without any packet for the full window.
+            if matches!(fsm.state(), FsmState::Scrolling)
+                && last_packet_at.elapsed() >= SCROLLING_WATCHDOG
+            {
                 warn!("scrolling watchdog fired — forcing idle, resuming passthrough");
-                fsm.force_idle();
-                scrolling_since = None;
+                fsm.force_idle(&mut detector);
             }
             continue;
         }
 
-        let frame = match input.next_frame() {
-            Ok(Some(f)) => f,
-            Ok(None) => continue, // no SYN_REPORT in this fetch batch
+        let frames = match input.poll_frames() {
+            Ok(fs) => fs,
             Err(e) => {
                 warn!("evdev read error: {e}");
                 // On hot-unplug evdev returns ENODEV. Log and exit so
@@ -156,48 +160,52 @@ fn run(args: Args) -> Result<()> {
             }
         };
 
-        // Step the FSM. Use the state AFTER the step to decide
-        // forwarding — this means the engaging frame (Moving →
-        // Scrolling) is NOT forwarded (position frozen at the prior
-        // frame), and the lift frame (Scrolling → Debounce) IS
-        // forwarded (libinput sees a clean end-of-gesture).
-        let action = fsm.step(frame.frame, &mut detector, &config.scroll);
-
-        match action {
-            Action::None => {}
-            Action::EmitWheelV(t) => {
-                if let Err(e) = vwheel.emit_v(t) {
-                    warn!("uinput emit_v failed: {e}");
-                }
-                debug!(ticks = t, "emit vertical");
-            }
-            Action::EmitWheelH(t) => {
-                if let Err(e) = vwheel.emit_h(t) {
-                    warn!("uinput emit_h failed: {e}");
-                }
-                debug!(ticks = t, "emit horizontal");
-            }
+        if frames.is_empty() {
+            // No SYN_REPORT in this fetch (events were only partial).
+            continue;
         }
 
-        // Passthrough: forward the physical event batch to the virtual
-        // touchpad unless we're in Scrolling. This is the entire
-        // "cursor doesn't jump" mechanism — libinput only ever sees
-        // events on the virtual pad, so its state stays consistent.
-        if !matches!(fsm.state(), FsmState::Scrolling) {
-            if let Err(e) = vtouchpad.forward(&frame.events) {
-                warn!("virtual touchpad forward failed: {e}");
-            }
-            scrolling_since = None;
-        } else if scrolling_since.is_none() {
-            scrolling_since = Some(Instant::now());
-        }
+        // Got at least one packet; reset the watchdog.
+        last_packet_at = Instant::now();
 
-        // Post-frame watchdog check.
-        if let Some(t) = scrolling_since {
-            if t.elapsed() > SCROLLING_WATCHDOG {
-                warn!("scrolling watchdog fired (post-frame) — forcing idle");
-                fsm.force_idle();
-                scrolling_since = None;
+        for pf in frames {
+            // Snapshot pre-step state. The forwarding decision uses
+            // BOTH pre and post: pre tells us whether positions need
+            // stripping (lift batch), post tells us whether to forward
+            // at all (suppress during Scrolling).
+            let prev_state = fsm.state();
+            let action = fsm.step(pf.frame, &mut detector, &config.scroll);
+            let now_state = fsm.state();
+
+            match action {
+                Action::None => {}
+                Action::EmitWheelV(t) => {
+                    if let Err(e) = vwheel.emit_v(t) {
+                        warn!("uinput emit_v failed: {e}");
+                    }
+                    debug!(ticks = t, "emit vertical");
+                }
+                Action::EmitWheelH(t) => {
+                    if let Err(e) = vwheel.emit_h(t) {
+                        warn!("uinput emit_h failed: {e}");
+                    }
+                    debug!(ticks = t, "emit horizontal");
+                }
+            }
+
+            // Passthrough:
+            //   post = Scrolling → suppress entirely (cursor frozen).
+            //   pre = Scrolling && post != Scrolling → lift batch:
+            //          forward but strip position events, so libinput
+            //          sees BTN_TOUCH=0 / tracking_id=-1 without a
+            //          synthetic jump from the pre-engagement
+            //          coordinate.
+            //   otherwise → forward verbatim.
+            if !matches!(now_state, FsmState::Scrolling) {
+                let strip_positions = matches!(prev_state, FsmState::Scrolling);
+                if let Err(e) = vtouchpad.forward(&pf.events, strip_positions) {
+                    warn!("virtual touchpad forward failed: {e}");
+                }
             }
         }
     }

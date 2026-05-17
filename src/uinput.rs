@@ -16,8 +16,8 @@ use std::path::Path;
 
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsInfo, AttributeSet, BusType, Device, EventType, InputEvent, InputId, RelativeAxisType,
-    UinputAbsSetup,
+    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, Device, EventType, InputEvent, InputId,
+    RelativeAxisType, UinputAbsSetup,
 };
 
 use crate::error::{Error, Result};
@@ -201,15 +201,39 @@ impl UinputTouchpad {
         Ok(Self { dev })
     }
 
-    /// Forward a batch of physical events to the virtual touchpad. The
-    /// caller is responsible for deciding whether to forward at all
-    /// (e.g., suppress while the FSM is in Scrolling). SYN_REPORTs in
-    /// the input are stripped because `emit()` inserts its own.
-    pub fn forward(&mut self, events: &[InputEvent]) -> Result<()> {
+    /// Forward a batch of physical events to the virtual touchpad.
+    /// The caller is responsible for deciding whether to forward at
+    /// all (e.g., suppress while the FSM is in Scrolling).
+    ///
+    /// SYN_REPORTs in the input are stripped because `emit()` inserts
+    /// its own. When `strip_positions` is true, ABS_X / ABS_Y /
+    /// ABS_MT_POSITION_X / ABS_MT_POSITION_Y events are also dropped
+    /// — used for the lift batch that transitions out of Scrolling,
+    /// so libinput sees the BTN_TOUCH=0 / ABS_MT_TRACKING_ID=-1
+    /// transition without a synthetic position jump from the prior
+    /// pre-engagement position.
+    pub fn forward(&mut self, events: &[InputEvent], strip_positions: bool) -> Result<()> {
         let filtered: Vec<InputEvent> = events
             .iter()
             .copied()
-            .filter(|ev| ev.event_type() != EventType::SYNCHRONIZATION)
+            .filter(|ev| {
+                if ev.event_type() == EventType::SYNCHRONIZATION {
+                    return false;
+                }
+                if strip_positions && ev.event_type() == EventType::ABSOLUTE {
+                    let axis = AbsoluteAxisType(ev.code());
+                    if matches!(
+                        axis,
+                        AbsoluteAxisType::ABS_X
+                            | AbsoluteAxisType::ABS_Y
+                            | AbsoluteAxisType::ABS_MT_POSITION_X
+                            | AbsoluteAxisType::ABS_MT_POSITION_Y
+                    ) {
+                        return false;
+                    }
+                }
+                true
+            })
             .collect();
         if filtered.is_empty() {
             return Ok(());

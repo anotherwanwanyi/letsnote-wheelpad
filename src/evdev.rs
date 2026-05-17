@@ -140,30 +140,46 @@ impl InputDevice {
         })
     }
 
-    /// Block until the next event batch, update internal slot state,
-    /// and return both the assembled high-level frame AND the raw
-    /// events. The raw events let the caller forward to the virtual
-    /// touchpad (passthrough architecture).
-    pub fn next_frame(&mut self) -> Result<Option<PhysicalFrame>> {
+    /// Block until events are available, then return ALL complete
+    /// SYN_REPORT-bounded frames from this fetch. If the daemon was
+    /// briefly descheduled and the kernel has buffered multiple
+    /// frames, every one is returned so the caller can step the FSM
+    /// and forward to the virtual touchpad per-frame — gluing N
+    /// kernel batches into one virtual batch loses per-frame timing
+    /// and corrupts libinput's state.
+    ///
+    /// Any trailing events without a closing SYN_REPORT are kept in
+    /// internal state for the next call's first frame.
+    pub fn poll_frames(&mut self) -> Result<Vec<PhysicalFrame>> {
         let events: Vec<InputEvent> = self
             .device
             .fetch_events()
             .map_err(|source| Error::EvdevRead { source })?
             .collect();
-        let mut frame_out: Option<TouchFrame> = None;
-        for ev in &events {
+        let mut frames: Vec<PhysicalFrame> = Vec::new();
+        let mut batch_events: Vec<InputEvent> = Vec::new();
+        for ev in events {
+            batch_events.push(ev);
             match ev.event_type() {
                 EventType::ABSOLUTE => self.apply_abs(ev.code(), ev.value()),
                 EventType::KEY if ev.code() == Key::BTN_TOUCH.code() => {
                     self.contact = ev.value() != 0;
                 }
                 EventType::SYNCHRONIZATION if ev.code() == 0 => {
-                    frame_out = Some(self.assemble_frame());
+                    let frame = self.assemble_frame();
+                    frames.push(PhysicalFrame {
+                        frame,
+                        events: std::mem::take(&mut batch_events),
+                    });
                 }
                 _ => {}
             }
         }
-        Ok(frame_out.map(|frame| PhysicalFrame { frame, events }))
+        // Trailing events without a closing SYN_REPORT are dropped.
+        // The kernel always closes each report with SYN; partial
+        // batches at the tail would indicate an evdev read split
+        // mid-report, which `fetch_events` shouldn't produce.
+        Ok(frames)
     }
 
     fn apply_abs(&mut self, code: u16, value: i32) {

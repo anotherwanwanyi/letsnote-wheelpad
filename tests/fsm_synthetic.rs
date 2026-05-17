@@ -171,7 +171,7 @@ fn force_idle_resets_state() {
     drive(&mut fsm, &mut det, &scroll, &[start, mid]);
     assert!(matches!(fsm.state(), FsmState::Scrolling));
 
-    fsm.force_idle();
+    fsm.force_idle(&mut det);
     assert!(matches!(fsm.state(), FsmState::Idle));
 }
 

@@ -193,11 +193,15 @@ impl Fsm {
         }
     }
 
-    /// Reset state to Idle. Used by the watchdog when Scrolling has
-    /// persisted without progress; restoring Idle resumes touchpad
-    /// passthrough so the cursor isn't frozen indefinitely.
-    pub fn force_idle(&mut self) {
+    /// Reset state to Idle and clear the detector's accumulator and
+    /// history. Used by the watchdog when Scrolling has persisted
+    /// without packet progress; restoring Idle resumes touchpad
+    /// passthrough so the cursor isn't frozen indefinitely. We reset
+    /// the detector too so a fresh gesture after the watchdog kick
+    /// doesn't start from a stale half-filled history.
+    pub fn force_idle(&mut self, detector: &mut CircularDetector) {
         self.state = FsmState::Idle;
+        detector.on_gesture_start();
     }
 }
 
