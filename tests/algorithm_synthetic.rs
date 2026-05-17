@@ -166,20 +166,27 @@ fn engagement_swept_angle_is_signed() {
 
 #[test]
 fn engagement_threshold_pi_over_12() {
+    // Use r = 5000 instead of 200 so i32 rounding error
+    // (arctan(0.5 / r)) is well below the ±0.001 rad margin we use to
+    // straddle the trigger. At r = 200 the rounding error was ~0.0025
+    // rad, larger than the margin, which made the boundary test
+    // flaky.
+    const R: f64 = 5000.0;
+    let start = TouchSample { x: R as i32, y: 0 };
+
     // Just past π/12 (15°) → above trigger.
-    let start = TouchSample { x: 200, y: 0 };
     let theta = TRIGGER_ANGLE + 0.001;
     let end_above = TouchSample {
-        x: (200.0 * theta.cos()).round() as i32,
-        y: (200.0 * theta.sin()).round() as i32,
+        x: (R * theta.cos()).round() as i32,
+        y: (R * theta.sin()).round() as i32,
     };
     assert!(engagement_swept_angle(0, 0, start, end_above).abs() > TRIGGER_ANGLE);
 
     // Just shy of π/12 → below trigger.
     let theta = TRIGGER_ANGLE - 0.001;
     let end_below = TouchSample {
-        x: (200.0 * theta.cos()).round() as i32,
-        y: (200.0 * theta.sin()).round() as i32,
+        x: (R * theta.cos()).round() as i32,
+        y: (R * theta.sin()).round() as i32,
     };
     assert!(engagement_swept_angle(0, 0, start, end_below).abs() < TRIGGER_ANGLE);
 }
