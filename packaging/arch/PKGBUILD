@@ -1,15 +1,15 @@
-# Maintainer: yourname <you@example.org>
+# Maintainer: ねらひかだ <hkshirorom@yahoo.co.jp>
 pkgname=letsnote-wheelpad
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Userland daemon: Panasonic Let's Note WheelPad circular touchpad scroll on Linux"
 arch=('x86_64')
-url="https://github.com/yourname/letsnote-wheelpad"
+url="https://github.com/Nerahikada/letsnote-wheelpad"
 license=('MIT')
 depends=('systemd' 'udev')
 makedepends=('cargo' 'rust')
 install="${pkgname}.install"
-source=("$pkgname-$pkgver.tar.gz::https://github.com/yourname/letsnote-wheelpad/archive/v$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Nerahikada/letsnote-wheelpad/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {

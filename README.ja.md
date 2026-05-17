@@ -40,7 +40,7 @@ systemctl --user enable --now letsnote-wheelpad.service
 ### ソースから
 
 ```sh
-git clone https://github.com/yourname/letsnote-wheelpad
+git clone https://github.com/Nerahikada/letsnote-wheelpad
 cd letsnote-wheelpad
 cargo build --release
 sudo install -Dm755 target/release/letsnote-wheelpad /usr/bin/letsnote-wheelpad

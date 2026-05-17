@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "Userland daemon that ports Panasonic Let's Note WheelPad (circular touchpad scroll) to Linux"
 license = "MIT"
-repository = "https://github.com/yourname/letsnote-wheelpad"
+repository = "https://github.com/Nerahikada/letsnote-wheelpad"
 readme = "README.md"
 keywords = ["touchpad", "uinput", "letsnote", "wheelpad", "scroll"]
 categories = ["hardware-support", "command-line-utilities"]
@@ -37,8 +37,8 @@ panic = "abort"
 # cargo-deb metadata (Ubuntu / Debian package)
 # ---------------------------------------------------------------------------
 [package.metadata.deb]
-maintainer = "Let's Note WheelPad maintainers"
-copyright = "2026, Let's Note WheelPad maintainers"
+maintainer = "ねらひかだ <hkshirorom@yahoo.co.jp>"
+copyright = "2026, ねらひかだ"
 license-file = ["LICENSE", "0"]
 extended-description = """\
 Userland daemon that reproduces the Panasonic Let's Note WheelPad circular
