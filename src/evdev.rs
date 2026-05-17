@@ -45,6 +45,16 @@ struct SlotState {
     y: i32,
 }
 
+/// One SYN_REPORT-bounded batch of physical events plus the
+/// high-level frame assembled from them.
+pub struct PhysicalFrame {
+    pub frame: TouchFrame,
+    /// All events from the underlying fetch, in original order.
+    /// Forwarded verbatim to the virtual touchpad (minus the trailing
+    /// SYN_REPORT, which `emit()` re-inserts).
+    pub events: Vec<InputEvent>,
+}
+
 impl InputDevice {
     /// Open the device at `path` and validate required capabilities.
     pub fn open(path: &Path) -> Result<Self> {
@@ -130,31 +140,30 @@ impl InputDevice {
         })
     }
 
-    /// Block until the next SYN_REPORT and return the assembled frame.
-    /// Returns `None` if no positional update was seen (e.g., a pure
-    /// button-only sync) — the caller should treat this as "no new
-    /// information this frame" rather than as an event drop.
-    pub fn next_frame(&mut self) -> Result<Option<TouchFrame>> {
+    /// Block until the next event batch, update internal slot state,
+    /// and return both the assembled high-level frame AND the raw
+    /// events. The raw events let the caller forward to the virtual
+    /// touchpad (passthrough architecture).
+    pub fn next_frame(&mut self) -> Result<Option<PhysicalFrame>> {
         let events: Vec<InputEvent> = self
             .device
             .fetch_events()
             .map_err(|source| Error::EvdevRead { source })?
             .collect();
         let mut frame_out: Option<TouchFrame> = None;
-        for ev in events {
+        for ev in &events {
             match ev.event_type() {
                 EventType::ABSOLUTE => self.apply_abs(ev.code(), ev.value()),
                 EventType::KEY if ev.code() == Key::BTN_TOUCH.code() => {
                     self.contact = ev.value() != 0;
                 }
                 EventType::SYNCHRONIZATION if ev.code() == 0 => {
-                    // SYN_REPORT
                     frame_out = Some(self.assemble_frame());
                 }
                 _ => {}
             }
         }
-        Ok(frame_out)
+        Ok(frame_out.map(|frame| PhysicalFrame { frame, events }))
     }
 
     fn apply_abs(&mut self, code: u16, value: i32) {
@@ -213,5 +222,4 @@ impl InputDevice {
             },
         }
     }
-
 }

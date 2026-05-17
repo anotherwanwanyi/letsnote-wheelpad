@@ -12,13 +12,12 @@ use letsnote_wheelpad::config::Config;
 use letsnote_wheelpad::detector::CircularDetector;
 use letsnote_wheelpad::error::{Error, Result};
 use letsnote_wheelpad::evdev::InputDevice;
-use letsnote_wheelpad::fsm::{Action, Fsm};
-use letsnote_wheelpad::grab::Grabber;
-use letsnote_wheelpad::uinput::UinputDevice;
+use letsnote_wheelpad::fsm::{Action, Fsm, FsmState};
+use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
 
 /// 5 second watchdog — if the FSM has been Scrolling without consuming a
-/// packet for this long the grab is forcibly released and we drop back
-/// to Idle. linux-design §14 risk 13.
+/// packet for this long, force back to Idle so passthrough resumes and
+/// the cursor unfreezes. linux-design §14 risk 13.
 const SCROLLING_WATCHDOG: Duration = Duration::from_secs(5);
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -75,40 +74,53 @@ fn run(args: Args) -> Result<()> {
         "touchpad ranges queried"
     );
 
-    // 2. Create the virtual wheel device early — any failure here
-    //    happens before we start grabbing.
-    let mut uinput = UinputDevice::create()?;
-    info!("uinput device created");
+    // 2. Construct the virtual touchpad BEFORE we grab the physical
+    //    pad — it has to read the physical pad's capabilities, and we
+    //    want any uinput-creation failure to happen before libinput
+    //    loses access. If uinput device creation fails (e.g., missing
+    //    kernel module) we exit cleanly without a grab held.
+    let mut vtouchpad = UinputTouchpad::create_from_physical(&input.device)?;
+    info!("virtual touchpad created");
 
-    // 3. Notify systemd we're ready. After this point dependent units
-    //    can start.
+    // 3. Construct the virtual wheel — same lifecycle considerations.
+    let mut vwheel = UinputWheel::create()?;
+    info!("virtual wheel created");
+
+    // 4. Grab the physical pad permanently. After this point libinput
+    //    sees no events from the physical device; everything flows
+    //    through our virtual touchpad. Releasing the grab is handled
+    //    by `Drop` on `input.device` (and by the panic-safety cleanup
+    //    after the main loop returns).
+    input.device.grab().map_err(|e| Error::Grab {
+        source: nix::errno::Errno::from_i32(e.raw_os_error().unwrap_or(0)),
+    })?;
+    info!("physical touchpad grabbed (passthrough mode)");
+
+    // 5. Notify systemd we're ready.
     if let Err(e) = sd_notify_ready() {
-        // Not fatal — Type=simple users will hit this path harmlessly.
         warn!("sd_notify Ready failed (acceptable outside systemd): {e}");
     }
 
-    // 4. Build the algorithm and FSM. History capacity is fixed at 20
+    // 6. Build the algorithm and FSM. History capacity is fixed at 20
     //    to match Windows WheelPad exactly (D-021-followup).
     let mut detector = CircularDetector::new();
     let mut fsm = Fsm::new(input.center_x, input.center_y);
-    let mut grabber = Grabber::new();
 
-    // 6. Signal handling — SIGTERM / SIGINT set the static flag; the
-    //    main loop checks it after each iteration.
+    // 7. Signal handling.
     install_signal_handlers()?;
 
-    // 7. Main loop.
+    // 8. Main loop.
     let raw_fd = input.device.as_raw_fd();
-    let mut last_packet_during_scrolling: Option<Instant> = None;
+    let mut scrolling_since: Option<Instant> = None;
 
     while !STOP.load(Ordering::Relaxed) {
-        let timeout_ms: i32 = if grabber.is_active() {
-            // While scrolling, cap the wait so the watchdog can fire.
+        // While scrolling, cap the wait so the watchdog can fire.
+        let timeout_ms: i32 = if matches!(fsm.state(), FsmState::Scrolling) {
             SCROLLING_WATCHDOG.as_millis() as i32
         } else {
             -1
         };
-        // SAFETY: raw_fd is owned by `input.device` which outlives this
+        // SAFETY: raw_fd is owned by `input.device` which outlives the
         // borrow for the iteration; we never read/write through the
         // BorrowedFd ourselves.
         let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
@@ -123,79 +135,76 @@ fn run(args: Args) -> Result<()> {
         };
 
         if n == 0 {
-            if grabber.is_active() {
-                warn!("scrolling watchdog fired — releasing grab");
-                let _ = grabber.release(&mut input.device);
-                let _ = fsm.force_release();
-                last_packet_during_scrolling = None;
+            // Timeout. Only meaningful while scrolling.
+            if matches!(fsm.state(), FsmState::Scrolling) {
+                warn!("scrolling watchdog fired — forcing idle, resuming passthrough");
+                fsm.force_idle();
+                scrolling_since = None;
             }
             continue;
         }
 
-        match input.next_frame() {
-            Ok(Some(frame)) => {
-                let actions = fsm.step(frame, &mut detector, &config.scroll);
-                for action in actions.iter().copied() {
-                    match action {
-                        Action::None => {}
-                        Action::GrabPhysical => {
-                            if let Err(e) = grabber.acquire(&mut input.device) {
-                                warn!("failed to grab physical pad: {e}");
-                            } else {
-                                debug!("grab acquired");
-                            }
-                            last_packet_during_scrolling = Some(Instant::now());
-                        }
-                        Action::ReleasePhysical => {
-                            if let Err(e) = grabber.release(&mut input.device) {
-                                warn!("failed to release grab: {e}");
-                            } else {
-                                debug!("grab released");
-                            }
-                            last_packet_during_scrolling = None;
-                        }
-                        Action::EmitWheelV(t) => {
-                            if let Err(e) = uinput.emit_v(t) {
-                                warn!("uinput emit_v failed: {e}");
-                            }
-                            debug!(ticks = t, "emit vertical");
-                        }
-                        Action::EmitWheelH(t) => {
-                            if let Err(e) = uinput.emit_h(t) {
-                                warn!("uinput emit_h failed: {e}");
-                            }
-                            debug!(ticks = t, "emit horizontal");
-                        }
-                    }
-                }
-                if grabber.is_active() {
-                    last_packet_during_scrolling = Some(Instant::now());
-                }
-            }
-            Ok(None) => {
-                // No SYN_REPORT in this fetch batch — nothing to do.
-            }
+        let frame = match input.next_frame() {
+            Ok(Some(f)) => f,
+            Ok(None) => continue, // no SYN_REPORT in this fetch batch
             Err(e) => {
                 warn!("evdev read error: {e}");
-                // On hot-unplug evdev returns ENODEV here. v1 behaviour
-                // (linux-design.md §14 risk 9): log and exit so systemd
-                // restarts us. A future enhancement could re-enumerate.
+                // On hot-unplug evdev returns ENODEV. Log and exit so
+                // systemd restarts us. A future enhancement could
+                // re-enumerate the device.
                 break;
+            }
+        };
+
+        // Step the FSM. Use the state AFTER the step to decide
+        // forwarding — this means the engaging frame (Moving →
+        // Scrolling) is NOT forwarded (position frozen at the prior
+        // frame), and the lift frame (Scrolling → Debounce) IS
+        // forwarded (libinput sees a clean end-of-gesture).
+        let action = fsm.step(frame.frame, &mut detector, &config.scroll);
+
+        match action {
+            Action::None => {}
+            Action::EmitWheelV(t) => {
+                if let Err(e) = vwheel.emit_v(t) {
+                    warn!("uinput emit_v failed: {e}");
+                }
+                debug!(ticks = t, "emit vertical");
+            }
+            Action::EmitWheelH(t) => {
+                if let Err(e) = vwheel.emit_h(t) {
+                    warn!("uinput emit_h failed: {e}");
+                }
+                debug!(ticks = t, "emit horizontal");
             }
         }
 
-        if let Some(t) = last_packet_during_scrolling {
-            if grabber.is_active() && t.elapsed() > SCROLLING_WATCHDOG {
-                warn!("scrolling watchdog fired (post-frame) — releasing grab");
-                let _ = grabber.release(&mut input.device);
-                let _ = fsm.force_release();
-                last_packet_during_scrolling = None;
+        // Passthrough: forward the physical event batch to the virtual
+        // touchpad unless we're in Scrolling. This is the entire
+        // "cursor doesn't jump" mechanism — libinput only ever sees
+        // events on the virtual pad, so its state stays consistent.
+        if !matches!(fsm.state(), FsmState::Scrolling) {
+            if let Err(e) = vtouchpad.forward(&frame.events) {
+                warn!("virtual touchpad forward failed: {e}");
+            }
+            scrolling_since = None;
+        } else if scrolling_since.is_none() {
+            scrolling_since = Some(Instant::now());
+        }
+
+        // Post-frame watchdog check.
+        if let Some(t) = scrolling_since {
+            if t.elapsed() > SCROLLING_WATCHDOG {
+                warn!("scrolling watchdog fired (post-frame) — forcing idle");
+                fsm.force_idle();
+                scrolling_since = None;
             }
         }
     }
 
     info!("shutting down");
-    let _ = grabber.release(&mut input.device);
+    // Ungrab so the next daemon launch can read the device.
+    let _ = input.device.ungrab();
     Ok(())
 }
 

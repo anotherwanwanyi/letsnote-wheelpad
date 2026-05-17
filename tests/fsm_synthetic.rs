@@ -32,11 +32,9 @@ fn drive(
 ) -> Vec<Action> {
     let mut acc = Vec::new();
     for f in frames {
-        let actions = fsm.step(*f, detector, scroll);
-        for a in actions.iter().copied() {
-            if !matches!(a, Action::None) {
-                acc.push(a);
-            }
+        let action = fsm.step(*f, detector, scroll);
+        if !matches!(action, Action::None) {
+            acc.push(action);
         }
     }
     acc
@@ -118,7 +116,9 @@ fn moving_to_contact_on_slip_back_into_dead_zone() {
 #[test]
 fn moving_to_scrolling_on_swept_angle_past_trigger() {
     // Sweep > π/12 from engage_start while staying outside the radial
-    // gate → Scrolling. Verify the grab action fires.
+    // gate → Scrolling. With the passthrough architecture there is no
+    // longer a Grab action to observe; the state transition is the
+    // signal the runtime keys off.
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
@@ -131,17 +131,12 @@ fn moving_to_scrolling_on_swept_angle_past_trigger() {
     let end_y = 500 + (220.0 * theta.sin()).round() as i32;
     let end = touch(end_x, end_y);
 
-    let actions = drive(&mut fsm, &mut det, &scroll, &[start, end]);
+    drive(&mut fsm, &mut det, &scroll, &[start, end]);
     assert!(matches!(fsm.state(), FsmState::Scrolling));
-    assert!(
-        actions.iter().any(|a| matches!(a, Action::GrabPhysical)),
-        "expected GrabPhysical, got {:?}",
-        actions
-    );
 }
 
 #[test]
-fn scrolling_to_debounce_on_lift_with_release_action() {
+fn scrolling_to_debounce_on_lift() {
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
@@ -155,9 +150,29 @@ fn scrolling_to_debounce_on_lift_with_release_action() {
     drive(&mut fsm, &mut det, &scroll, &[start, mid]);
     assert!(matches!(fsm.state(), FsmState::Scrolling));
 
-    let actions = drive(&mut fsm, &mut det, &scroll, &[lift()]);
+    drive(&mut fsm, &mut det, &scroll, &[lift()]);
     assert!(matches!(fsm.state(), FsmState::Debounce));
-    assert!(actions.iter().any(|a| matches!(a, Action::ReleasePhysical)));
+}
+
+#[test]
+fn force_idle_resets_state() {
+    // Watchdog path: after force_idle the FSM is back at Idle even if
+    // it was mid-Scrolling.
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    let start = touch(720, 500);
+    let theta = PI / 8.0;
+    let mid = touch(
+        500 + (220.0 * theta.cos()).round() as i32,
+        500 + (220.0 * theta.sin()).round() as i32,
+    );
+    drive(&mut fsm, &mut det, &scroll, &[start, mid]);
+    assert!(matches!(fsm.state(), FsmState::Scrolling));
+
+    fsm.force_idle();
+    assert!(matches!(fsm.state(), FsmState::Idle));
 }
 
 #[test]
