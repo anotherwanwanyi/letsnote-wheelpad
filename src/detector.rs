@@ -5,7 +5,10 @@ use std::f64::consts::PI;
 
 const PI2: f64 = 2.0 * PI;
 
-pub const TRIGGER_ANGLE: f64 = PI / 12.0;
+/// Early circular-intent threshold. The old Windows-faithful π/12 (15°)
+/// gate leaked a visibly long pointer movement before capture; π/24 (7.5°)
+/// is paired with the FSM's curvature and tangential-motion checks.
+pub const TRIGGER_ANGLE: f64 = PI / 24.0;
 pub const NOISE_REJECT_ANGLE: f64 = PI / 4.0;
 pub const ZONE_RADIANS: f64 = PI / 8.0;
 pub const SAMPLE_DEADBAND_SQ: i64 = 400;

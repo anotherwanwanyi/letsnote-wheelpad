@@ -1,5 +1,7 @@
-// 6-state FSM mirroring FUN_1400046a0 — see analysis/RE-findings.md §4
-// and analysis/linux-design.md §5.
+// WheelPad FSM. The original Windows states are augmented with explicit
+// MultiTouch and Passthrough arbitration states for Linux/libinput.
+
+use std::f64::consts::PI;
 
 use crate::config::Scroll;
 use crate::detector::{
@@ -16,12 +18,14 @@ pub enum FsmState {
     Moving {
         tracking_id: i32,
         slot: usize,
-        engage_start: TouchSample,
     },
     /// Two or more contacts were observed before circular scrolling was
     /// captured. Keep forwarding the physical stream to libinput and do
     /// not reconsider circular scrolling until every finger has lifted.
     MultiTouch,
+    /// The pending outer-ring contact was classified as ordinary pointer
+    /// input. Forward it until all-up and never capture it mid-gesture.
+    Passthrough,
     Scrolling {
         tracking_id: i32,
         slot: usize,
@@ -58,9 +62,8 @@ pub struct TouchFrame {
 }
 
 /// Side effects the FSM asks the runtime to perform. The runtime also
-/// derives event forwarding (passthrough) directly from `Fsm::state()`,
-/// so the FSM does NOT emit "start/stop grabbing" actions any more —
-/// the physical pad is grabbed permanently at startup.
+/// derives whether to hold, replay, or suppress touchpad frames from the
+/// state transition, so the FSM does not emit forwarding actions itself.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     None,
@@ -72,6 +75,23 @@ pub struct Fsm {
     state: FsmState,
     center_x: i32,
     center_y: i32,
+    intent_samples: Vec<TouchSample>,
+}
+
+const INTENT_SAMPLE_DEADBAND_SQ: i64 = 64; // 8 device units
+const INTENT_MIN_SAMPLES: usize = 3;
+const INTENT_MAX_SAMPLES: usize = 20;
+const INTENT_MIN_TURN: f64 = PI / 180.0; // 1° of net chord-direction curvature
+const INTENT_TANGENTIAL_RATIO: f64 = 1.0;
+const POINTER_RADIAL_RATIO: f64 = 1.5;
+const POINTER_MIN_RADIAL_TRAVEL: f64 = 40.0;
+const POINTER_STRAIGHT_SWEEP: f64 = PI / 10.0; // 18°
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntentDecision {
+    Pending,
+    Circular,
+    Pointer,
 }
 
 impl Fsm {
@@ -80,6 +100,7 @@ impl Fsm {
             state: FsmState::Idle,
             center_x,
             center_y,
+            intent_samples: Vec::with_capacity(INTENT_MAX_SAMPLES),
         }
     }
 
@@ -96,10 +117,9 @@ impl Fsm {
     /// shift register) and the scroll config. Returns the (at most one)
     /// wheel-emission action the runtime needs to perform.
     ///
-    /// The runtime derives event-forwarding decisions (suppress motion
-    /// to the virtual touchpad during scroll) directly from
-    /// [`Fsm::state`] after this call returns; no grab/release actions
-    /// flow through this return value any more.
+    /// The runtime derives event-forwarding decisions from the states
+    /// immediately before and after this call; no grab/release actions
+    /// flow through this return value.
     pub fn step(
         &mut self,
         frame: &TouchFrame,
@@ -111,6 +131,7 @@ impl Fsm {
         // never advance past Idle and never emit ticks.
         if !scroll.enable {
             self.state = FsmState::Idle;
+            self.intent_samples.clear();
             return Action::None;
         }
 
@@ -128,18 +149,15 @@ impl Fsm {
                 let s = touch.pos;
                 // Fresh touch-down: radial-gate classifier (FUN_140005a00).
                 if radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
-                    // Outside dead zone → MOVING. Capture engage_start
-                    // here, matching DAT_14003cc18 being set at
-                    // FUN_1400046a0 line 203 only on the state 1 → state 3
-                    // transition. The detector's accumulator and history
-                    // are NOT reset here; that happens on the
-                    // Moving → Scrolling transition (mirroring
-                    // FUN_1400046a0 line 151 which zeros DAT_14003cb00).
+                    // Outside dead zone → pending circular intent. Raw
+                    // frames are held by the runtime until this state is
+                    // resolved as circular or ordinary pointer input.
                     self.state = FsmState::Moving {
                         tracking_id: touch.tracking_id,
                         slot: touch.slot,
-                        engage_start: s,
                     };
+                    self.intent_samples.clear();
+                    self.intent_samples.push(s);
                 } else {
                     // Inside dead zone → CONTACT (trap).
                     self.state = FsmState::Contact { origin: s };
@@ -165,6 +183,7 @@ impl Fsm {
             FsmState::Moving { .. } if !has_contact => {
                 // Lift before engagement → Idle.
                 self.state = FsmState::Idle;
+                self.intent_samples.clear();
                 Action::None
             }
             FsmState::Moving { .. } if frame.touches.len() > 1 => {
@@ -172,53 +191,53 @@ impl Fsm {
                 // has lifted. This prevents a two-finger scroll or pinch
                 // from being captured later by the circular recognizer.
                 self.state = FsmState::MultiTouch;
+                self.intent_samples.clear();
                 Action::None
             }
-            FsmState::Moving {
-                tracking_id,
-                slot,
-                engage_start,
-            } => {
+            FsmState::Moving { tracking_id, slot } => {
                 let touch = frame.touches[0];
                 if touch.tracking_id != tracking_id {
                     // One finger was replaced by another without an
                     // all-up frame. Do not splice two physical contacts
                     // into one candidate trajectory.
-                    self.state = FsmState::MultiTouch;
+                    self.state = FsmState::Passthrough;
+                    self.intent_samples.clear();
                     return Action::None;
                 }
                 let s = touch.pos;
                 if !radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
-                    // Slipped back into the dead zone — fall back to
-                    // Contact (FUN_1400046a0 case 3, lines 127-137).
-                    self.state = FsmState::Contact { origin: s };
+                    // Slipped back into the dead zone: this was ordinary
+                    // pointer movement. Flush the held frames and lock in
+                    // passthrough until all contacts lift.
+                    self.state = FsmState::Passthrough;
+                    self.intent_samples.clear();
                     Action::None
                 } else {
-                    let swept =
-                        engagement_swept_angle(self.center_x, self.center_y, engage_start, s);
-                    if swept.abs() > TRIGGER_ANGLE {
-                        // Engagement! Reset detector and enter Scrolling.
-                        // The physical pad is already grabbed (forever);
-                        // forwarding suppression is keyed off state.
-                        detector.on_gesture_start();
-                        self.state = FsmState::Scrolling { tracking_id, slot };
-                        // Feed the engaging sample so the first tick can
-                        // emit on this very frame if the gesture is fast
-                        // enough.
-                        if detector.push_if_moved(s) {
-                            let ticks = detector.step(scroll.sensitivity);
+                    match self.observe_intent_sample(s) {
+                        IntentDecision::Pending => Action::None,
+                        IntentDecision::Pointer => {
+                            self.state = FsmState::Passthrough;
+                            self.intent_samples.clear();
+                            Action::None
+                        }
+                        IntentDecision::Circular => {
+                            // Seed the detector with every held candidate
+                            // sample instead of throwing away the motion
+                            // that established circular intent.
+                            detector.on_gesture_start();
+                            let mut ticks = 0;
+                            for sample in self.intent_samples.drain(..) {
+                                if detector.push_if_moved(sample) {
+                                    ticks += detector.step(scroll.sensitivity);
+                                }
+                            }
+                            self.state = FsmState::Scrolling { tracking_id, slot };
                             if ticks != 0 {
                                 emit(ticks, scroll, self.center_x, self.center_y, s)
                             } else {
                                 Action::None
                             }
-                        } else {
-                            Action::None
                         }
-                    } else {
-                        // Stay in Moving until lift, slip-back, or
-                        // swept-angle threshold.
-                        Action::None
                     }
                 }
             }
@@ -230,11 +249,18 @@ impl Fsm {
             }
             FsmState::MultiTouch => Action::None,
 
+            // ---------- Passthrough — ordinary pointer owns this stream ----------
+            FsmState::Passthrough if !has_contact => {
+                self.state = FsmState::Idle;
+                Action::None
+            }
+            FsmState::Passthrough => Action::None,
+
             // ---------- Scrolling (state 4) ----------
             FsmState::Scrolling { .. } if !has_contact => {
-                // Lift → Debounce. State change alone is enough for the
-                // passthrough runtime to resume forwarding the lift
-                // events to the virtual touchpad.
+                // Lift → Debounce. The runtime suppresses this final
+                // physical frame because the captured contact was never
+                // exposed to the virtual touchpad.
                 self.state = FsmState::Debounce;
                 Action::None
             }
@@ -281,8 +307,111 @@ impl Fsm {
     /// doesn't start from a stale half-filled history.
     pub fn force_idle(&mut self, detector: &mut CircularDetector) {
         self.state = FsmState::Idle;
+        self.intent_samples.clear();
         detector.on_gesture_start();
     }
+
+    /// Resolve a still-pending candidate as ordinary pointer input.
+    ///
+    /// The runtime uses this as a safety valve when too many raw frames
+    /// have accumulated without enough meaningful movement to classify
+    /// the gesture. Returning `true` tells it to replay the held frames.
+    pub fn cancel_pending(&mut self) -> bool {
+        if matches!(self.state, FsmState::Moving { .. }) {
+            self.state = FsmState::Passthrough;
+            self.intent_samples.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn observe_intent_sample(&mut self, sample: TouchSample) -> IntentDecision {
+        if let Some(previous) = self.intent_samples.last() {
+            let dx = (sample.x - previous.x) as i64;
+            let dy = (sample.y - previous.y) as i64;
+            if dx * dx + dy * dy <= INTENT_SAMPLE_DEADBAND_SQ {
+                return IntentDecision::Pending;
+            }
+        }
+        if self.intent_samples.len() < INTENT_MAX_SAMPLES {
+            self.intent_samples.push(sample);
+        }
+
+        classify_intent(self.center_x, self.center_y, &self.intent_samples)
+    }
+}
+
+fn classify_intent(center_x: i32, center_y: i32, samples: &[TouchSample]) -> IntentDecision {
+    if samples.len() < INTENT_MIN_SAMPLES {
+        return IntentDecision::Pending;
+    }
+
+    let start = samples[0];
+    let current = *samples.last().expect("intent history is non-empty");
+    let swept = engagement_swept_angle(center_x, center_y, start, current);
+    let mut tangential = 0.0;
+    let mut radial = 0.0;
+    for pair in samples.windows(2) {
+        let (a0, r0) = polar(center_x, center_y, pair[0]);
+        let (a1, r1) = polar(center_x, center_y, pair[1]);
+        let da = wrap_angle(a1 - a0);
+        tangential += ((r0 + r1) * 0.5 * da).abs();
+        radial += (r1 - r0).abs();
+    }
+
+    let mut turn_sum = 0.0;
+    for triple in samples.windows(3) {
+        let a0 = segment_angle(triple[0], triple[1]);
+        let a1 = segment_angle(triple[1], triple[2]);
+        let turn = wrap_angle(a1 - a0);
+        turn_sum += turn;
+    }
+
+    // Use net curvature rather than requiring every local turn to have
+    // the same sign. Real evdev traces contain quantisation and finger
+    // jitter, so a single tiny counter-turn must not permanently reject
+    // an otherwise clear circular trajectory.
+    let aligned_turn = turn_sum * swept.signum();
+
+    if swept.abs() >= TRIGGER_ANGLE
+        && tangential >= radial * INTENT_TANGENTIAL_RATIO
+        && aligned_turn >= INTENT_MIN_TURN
+    {
+        IntentDecision::Circular
+    } else if (radial >= POINTER_MIN_RADIAL_TRAVEL && radial > tangential * POINTER_RADIAL_RATIO)
+        || (swept.abs() >= POINTER_STRAIGHT_SWEEP && aligned_turn < INTENT_MIN_TURN)
+        || samples.len() >= INTENT_MAX_SAMPLES
+    {
+        IntentDecision::Pointer
+    } else {
+        // Crossing the earliest circular threshold without yet having
+        // enough curvature is inconclusive, not proof of pointer intent.
+        // Keep observing so a slowly developing or slightly noisy circle
+        // can still capture this same contact stream.
+        IntentDecision::Pending
+    }
+}
+
+fn polar(center_x: i32, center_y: i32, sample: TouchSample) -> (f64, f64) {
+    let x = (sample.x - center_x) as f64;
+    let y = (sample.y - center_y) as f64;
+    (y.atan2(x), x.hypot(y))
+}
+
+fn segment_angle(from: TouchSample, to: TouchSample) -> f64 {
+    ((to.y - from.y) as f64).atan2((to.x - from.x) as f64)
+}
+
+fn wrap_angle(mut angle: f64) -> f64 {
+    let two_pi = 2.0 * PI;
+    if angle > PI {
+        angle -= two_pi;
+    }
+    if angle < -PI {
+        angle += two_pi;
+    }
+    angle
 }
 
 /// Apply reverse flags and the arc gate, then return the appropriate

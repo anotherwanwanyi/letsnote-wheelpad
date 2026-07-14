@@ -20,6 +20,11 @@ use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
 /// the cursor unfreezes. linux-design §14 risk 13.
 const SCROLLING_WATCHDOG: Duration = Duration::from_secs(5);
 
+/// Bound raw-frame buffering when an outer-ring contact produces many
+/// reports but too little meaningful motion for the intent classifier.
+/// Normal moving gestures resolve much earlier (after 3–20 samples).
+const MAX_PENDING_TOUCHPAD_FRAMES: usize = 64;
+
 static STOP: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser, Debug)]
@@ -113,6 +118,10 @@ fn run(args: Args) -> Result<()> {
     // 8. Main loop.
     let raw_fd = input.device.as_raw_fd();
     let mut last_packet_at = Instant::now();
+    // Outer-ring single-finger frames are held here while the FSM decides
+    // whether they are circular intent or ordinary pointer/multi-touch.
+    // Each entry remains one SYN_REPORT-bounded physical frame.
+    let mut pending_touchpad_frames = Vec::new();
 
     while !STOP.load(Ordering::Relaxed) {
         // While scrolling, cap the wait so the watchdog can fire when
@@ -168,10 +177,9 @@ fn run(args: Args) -> Result<()> {
         last_packet_at = Instant::now();
 
         for pf in frames {
-            // Snapshot pre-step state. The forwarding decision uses
-            // BOTH pre and post: pre tells us whether positions need
-            // stripping (lift batch), post tells us whether to forward
-            // at all (suppress during Scrolling).
+            // Snapshot pre-step state. Pending circular intent buffers
+            // complete physical frames; capture discards them, while a
+            // pointer/multi-touch decision replays them in original order.
             let prev_state = fsm.state();
             let action = fsm.step(&pf.frame, &mut detector, &config.scroll);
             let now_state = fsm.state();
@@ -192,23 +200,38 @@ fn run(args: Args) -> Result<()> {
                 }
             }
 
-            // Passthrough:
-            //   post = Scrolling → suppress entirely (cursor frozen).
-            //   pre = Scrolling && post != Scrolling → lift batch:
-            //          release the originally captured MT slot, then
-            //          forward the batch with positions stripped, so
-            //          libinput sees a complete all-up transition without
-            //          a synthetic jump or a stale contact.
-            //   otherwise → forward verbatim.
-            if let FsmState::Scrolling { slot, .. } = prev_state {
-                if !matches!(now_state, FsmState::Scrolling { .. }) {
-                    if let Err(e) = vtouchpad.finish_scroll(&pf.events, slot) {
-                        warn!("virtual touchpad scroll cleanup failed: {e}");
+            match forwarding_decision(prev_state, now_state) {
+                ForwardingDecision::Hold => {
+                    pending_touchpad_frames.push(pf.events);
+                    if pending_touchpad_frames.len() >= MAX_PENDING_TOUCHPAD_FRAMES {
+                        let cancelled = fsm.cancel_pending();
+                        debug_assert!(cancelled);
+                        debug!(
+                            frames = pending_touchpad_frames.len(),
+                            "pending intent buffer limit reached; choosing pointer passthrough"
+                        );
+                        for events in pending_touchpad_frames.drain(..) {
+                            if let Err(e) = vtouchpad.forward(&events, false) {
+                                warn!("virtual touchpad buffered forward failed: {e}");
+                            }
+                        }
                     }
                 }
-            } else if !matches!(now_state, FsmState::Scrolling { .. }) {
-                if let Err(e) = vtouchpad.forward(&pf.events, false) {
-                    warn!("virtual touchpad forward failed: {e}");
+                ForwardingDecision::FlushHeld => {
+                    pending_touchpad_frames.push(pf.events);
+                    for events in pending_touchpad_frames.drain(..) {
+                        if let Err(e) = vtouchpad.forward(&events, false) {
+                            warn!("virtual touchpad buffered forward failed: {e}");
+                        }
+                    }
+                }
+                ForwardingDecision::DiscardHeld => pending_touchpad_frames.clear(),
+                ForwardingDecision::Suppress => {}
+                ForwardingDecision::Forward => {
+                    debug_assert!(pending_touchpad_frames.is_empty());
+                    if let Err(e) = vtouchpad.forward(&pf.events, false) {
+                        warn!("virtual touchpad forward failed: {e}");
+                    }
                 }
             }
         }
@@ -217,6 +240,34 @@ fn run(args: Args) -> Result<()> {
     info!("shutting down");
     // `Drop for InputDevice` releases EVIOCGRAB.
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardingDecision {
+    Forward,
+    Hold,
+    FlushHeld,
+    DiscardHeld,
+    Suppress,
+}
+
+fn forwarding_decision(previous: FsmState, current: FsmState) -> ForwardingDecision {
+    let previous_pending = matches!(previous, FsmState::Moving { .. });
+    let current_pending = matches!(current, FsmState::Moving { .. });
+    let previous_scrolling = matches!(previous, FsmState::Scrolling { .. });
+    let current_scrolling = matches!(current, FsmState::Scrolling { .. });
+
+    if previous_pending && current_scrolling {
+        ForwardingDecision::DiscardHeld
+    } else if previous_scrolling || current_scrolling {
+        ForwardingDecision::Suppress
+    } else if current_pending {
+        ForwardingDecision::Hold
+    } else if previous_pending {
+        ForwardingDecision::FlushHeld
+    } else {
+        ForwardingDecision::Forward
+    }
 }
 
 fn init_tracing(config: &Config, debug_flag: bool) {
@@ -258,4 +309,58 @@ fn install_signal_handlers() -> Result<()> {
         sigaction(Signal::SIGINT, &action).map_err(|source| Error::Signal { source })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PENDING: FsmState = FsmState::Moving {
+        tracking_id: 10,
+        slot: 0,
+    };
+    const SCROLLING: FsmState = FsmState::Scrolling {
+        tracking_id: 10,
+        slot: 0,
+    };
+
+    #[test]
+    fn pending_frames_are_held_then_discarded_on_capture() {
+        assert_eq!(
+            forwarding_decision(FsmState::Idle, PENDING),
+            ForwardingDecision::Hold
+        );
+        assert_eq!(
+            forwarding_decision(PENDING, PENDING),
+            ForwardingDecision::Hold
+        );
+        assert_eq!(
+            forwarding_decision(PENDING, SCROLLING),
+            ForwardingDecision::DiscardHeld
+        );
+        assert_eq!(
+            forwarding_decision(SCROLLING, FsmState::Debounce),
+            ForwardingDecision::Suppress
+        );
+    }
+
+    #[test]
+    fn pending_frames_are_flushed_when_passthrough_wins() {
+        assert_eq!(
+            forwarding_decision(PENDING, FsmState::Passthrough),
+            ForwardingDecision::FlushHeld
+        );
+        assert_eq!(
+            forwarding_decision(PENDING, FsmState::MultiTouch),
+            ForwardingDecision::FlushHeld
+        );
+        assert_eq!(
+            forwarding_decision(PENDING, FsmState::Idle),
+            ForwardingDecision::FlushHeld
+        );
+        assert_eq!(
+            forwarding_decision(FsmState::Passthrough, FsmState::Passthrough),
+            ForwardingDecision::Forward
+        );
+    }
 }

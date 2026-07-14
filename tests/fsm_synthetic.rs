@@ -112,7 +112,7 @@ fn moving_to_idle_on_lift_before_engagement() {
 }
 
 #[test]
-fn moving_to_contact_on_slip_back_into_dead_zone() {
+fn moving_to_passthrough_on_slip_back_into_dead_zone() {
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
@@ -123,29 +123,201 @@ fn moving_to_contact_on_slip_back_into_dead_zone() {
         &scroll,
         &[touch(720, 500), touch(550, 500)],
     );
-    assert!(matches!(fsm.state(), FsmState::Contact { .. }));
+    assert!(matches!(fsm.state(), FsmState::Passthrough));
 }
 
 #[test]
-fn moving_to_scrolling_on_swept_angle_past_trigger() {
-    // Sweep > π/12 from engage_start while staying outside the radial
-    // gate → Scrolling. With the passthrough architecture there is no
-    // longer a Grab action to observe; the state transition is the
-    // signal the runtime keys off.
+fn moving_to_scrolling_on_early_curved_sweep() {
+    // Three samples forming a curved sweep past π/24 engage Scrolling.
+    // Candidate frames are held by the runtime until this transition.
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
 
     // engage_start at angle 0, r=220
     let start = touch(720, 500);
-    // sweep to angle π/8 (= 22.5°, > π/12 = 15°), r=220
+    // Two 11.25° curved steps exceed the 7.5° intent threshold.
+    let mid_theta = PI / 16.0;
+    let mid = touch(
+        500 + (220.0 * mid_theta.cos()).round() as i32,
+        500 + (220.0 * mid_theta.sin()).round() as i32,
+    );
     let theta = PI / 8.0;
     let end_x = 500 + (220.0 * theta.cos()).round() as i32;
     let end_y = 500 + (220.0 * theta.sin()).round() as i32;
     let end = touch(end_x, end_y);
 
-    drive(&mut fsm, &mut det, &scroll, &[start, end]);
+    drive(&mut fsm, &mut det, &scroll, &[start, mid, end]);
     assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+}
+
+#[test]
+fn clockwise_early_curved_sweep_also_enters_scrolling() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    let frames: Vec<_> = (0..=2)
+        .map(|i| {
+            let theta = -(i as f64) * PI / 16.0;
+            touch(
+                500 + (220.0 * theta.cos()).round() as i32,
+                500 + (220.0 * theta.sin()).round() as i32,
+            )
+        })
+        .collect();
+    drive(&mut fsm, &mut det, &scroll, &frames);
+
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+}
+
+#[test]
+fn dense_real_scale_circle_enters_scrolling_at_the_early_threshold() {
+    // The real device reports 0..771 on both axes. Use its approximate
+    // centre/radius and dense 2° steps rather than the much larger jumps
+    // used by the original idealised tests.
+    let mut fsm = Fsm::new(385, 385);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+    let frames: Vec<_> = (0..=4)
+        .map(|i| {
+            let theta = i as f64 * PI / 90.0;
+            touch(
+                385 + (340.0 * theta.cos()).round() as i32,
+                385 + (340.0 * theta.sin()).round() as i32,
+            )
+        })
+        .collect();
+
+    drive(&mut fsm, &mut det, &scroll, &frames);
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+}
+
+#[test]
+fn radial_sample_jitter_does_not_reject_a_circle() {
+    let mut fsm = Fsm::new(385, 385);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+    let radii = [340.0, 344.0, 338.0, 343.0, 340.0];
+    let frames: Vec<_> = radii
+        .iter()
+        .enumerate()
+        .map(|(i, radius)| {
+            let theta = i as f64 * PI / 90.0;
+            touch(
+                385 + (radius * theta.cos()).round() as i32,
+                385 + (radius * theta.sin()).round() as i32,
+            )
+        })
+        .collect();
+
+    drive(&mut fsm, &mut det, &scroll, &frames);
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+}
+
+#[test]
+fn inconclusive_motion_past_early_threshold_stays_pending() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    // A short tangent has crossed 7.5°, but three straight samples are
+    // not enough evidence to permanently reject a developing circle.
+    drive(
+        &mut fsm,
+        &mut det,
+        &scroll,
+        &[touch(720, 500), touch(720, 520), touch(720, 540)],
+    );
+    assert!(matches!(fsm.state(), FsmState::Moving { .. }));
+}
+
+#[test]
+fn inconclusive_start_can_still_develop_into_a_circle() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    // Begin with the same short tangent as above, then bend onto the
+    // r=220 circle. The old eager fallback entered Passthrough after the
+    // third sample and could never recognise the fourth.
+    drive(
+        &mut fsm,
+        &mut det,
+        &scroll,
+        &[
+            touch(720, 500),
+            touch(720, 520),
+            touch(720, 540),
+            touch(713, 553),
+        ],
+    );
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+}
+
+#[test]
+fn sustained_tangential_straight_line_becomes_passthrough() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    // Once the tangent reaches the larger straight-line decision angle,
+    // its lack of curvature is clear enough to choose pointer input.
+    drive(
+        &mut fsm,
+        &mut det,
+        &scroll,
+        &[
+            touch(720, 500),
+            touch(720, 520),
+            touch(720, 540),
+            touch(720, 560),
+            touch(720, 580),
+        ],
+    );
+    assert!(matches!(fsm.state(), FsmState::Passthrough));
+}
+
+#[test]
+fn pending_samples_preheat_scroll_detector() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    let frames: Vec<_> = (0..=4)
+        .map(|i| {
+            let theta = i as f64 * PI / 16.0;
+            touch(
+                500 + (220.0 * theta.cos()).round() as i32,
+                500 + (220.0 * theta.sin()).round() as i32,
+            )
+        })
+        .collect();
+    let actions = drive(&mut fsm, &mut det, &scroll, &frames);
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+    assert!(
+        !actions.is_empty(),
+        "held intent samples should contribute to the first scroll tick"
+    );
+}
+
+#[test]
+fn runtime_can_cancel_a_stalled_pending_candidate() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut detector = CircularDetector::new();
+    let scroll = default_scroll();
+
+    let actions = drive(&mut fsm, &mut detector, &scroll, &[touch(720, 500)]);
+    assert!(actions.is_empty());
+    assert!(matches!(fsm.state(), FsmState::Moving { .. }));
+
+    assert!(fsm.cancel_pending());
+    assert_eq!(fsm.state(), FsmState::Passthrough);
+    assert!(!fsm.cancel_pending());
+
+    // Passthrough is sticky for the remainder of this contact stream.
+    drive(&mut fsm, &mut detector, &scroll, &[touch(680, 550)]);
+    assert_eq!(fsm.state(), FsmState::Passthrough);
 }
 
 #[test]
@@ -155,12 +327,17 @@ fn scrolling_to_debounce_on_lift() {
     let scroll = default_scroll();
 
     let start = touch(720, 500);
+    let early_theta = PI / 16.0;
+    let early = touch(
+        500 + (220.0 * early_theta.cos()).round() as i32,
+        500 + (220.0 * early_theta.sin()).round() as i32,
+    );
     let theta = PI / 8.0;
     let mid_x = 500 + (220.0 * theta.cos()).round() as i32;
     let mid_y = 500 + (220.0 * theta.sin()).round() as i32;
     let mid = touch(mid_x, mid_y);
 
-    drive(&mut fsm, &mut det, &scroll, &[start, mid]);
+    drive(&mut fsm, &mut det, &scroll, &[start, early, mid]);
     assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
 
     drive(&mut fsm, &mut det, &scroll, &[lift()]);
@@ -269,6 +446,13 @@ fn captured_scroll_stays_locked_to_original_tracking_id() {
     // Deliberately start in slot 1, then add a lower-numbered slot after
     // capture. The recognizer must follow the tracking ID, not slot order.
     let start = touch_frame(&[(1, CAPTURED_ID, 720, 500)]);
+    let early_theta = PI / 16.0;
+    let early = touch_frame(&[(
+        1,
+        CAPTURED_ID,
+        500 + (220.0 * early_theta.cos()).round() as i32,
+        500 + (220.0 * early_theta.sin()).round() as i32,
+    )]);
     let theta = PI / 8.0;
     let engage = touch_frame(&[(
         1,
@@ -276,7 +460,7 @@ fn captured_scroll_stays_locked_to_original_tracking_id() {
         500 + (220.0 * theta.cos()).round() as i32,
         500 + (220.0 * theta.sin()).round() as i32,
     )]);
-    drive(&mut fsm, &mut det, &scroll, &[start, engage]);
+    drive(&mut fsm, &mut det, &scroll, &[start, early, engage]);
     assert!(matches!(
         fsm.state(),
         FsmState::Scrolling {
@@ -343,12 +527,17 @@ fn force_idle_resets_state() {
     let scroll = default_scroll();
 
     let start = touch(720, 500);
+    let early_theta = PI / 16.0;
+    let early = touch(
+        500 + (220.0 * early_theta.cos()).round() as i32,
+        500 + (220.0 * early_theta.sin()).round() as i32,
+    );
     let theta = PI / 8.0;
     let mid = touch(
         500 + (220.0 * theta.cos()).round() as i32,
         500 + (220.0 * theta.sin()).round() as i32,
     );
-    drive(&mut fsm, &mut det, &scroll, &[start, mid]);
+    drive(&mut fsm, &mut det, &scroll, &[start, early, mid]);
     assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
 
     fsm.force_idle(&mut det);
@@ -364,12 +553,17 @@ fn debounce_to_idle_on_next_frame_no_timer() {
     let scroll = default_scroll();
 
     let start = touch(720, 500);
+    let early_theta = PI / 16.0;
+    let early = touch(
+        500 + (220.0 * early_theta.cos()).round() as i32,
+        500 + (220.0 * early_theta.sin()).round() as i32,
+    );
     let theta = PI / 8.0;
     let mid_x = 500 + (220.0 * theta.cos()).round() as i32;
     let mid_y = 500 + (220.0 * theta.sin()).round() as i32;
     let mid = touch(mid_x, mid_y);
 
-    drive(&mut fsm, &mut det, &scroll, &[start, mid, lift()]);
+    drive(&mut fsm, &mut det, &scroll, &[start, early, mid, lift()]);
     assert!(matches!(fsm.state(), FsmState::Debounce));
 
     drive(&mut fsm, &mut det, &scroll, &[lift()]);
@@ -387,12 +581,17 @@ fn debounce_to_idle_even_if_finger_back_down() {
     let scroll = default_scroll();
 
     let start = touch(720, 500);
+    let early_theta = PI / 16.0;
+    let early = touch(
+        500 + (220.0 * early_theta.cos()).round() as i32,
+        500 + (220.0 * early_theta.sin()).round() as i32,
+    );
     let theta = PI / 8.0;
     let mid_x = 500 + (220.0 * theta.cos()).round() as i32;
     let mid_y = 500 + (220.0 * theta.sin()).round() as i32;
     let mid = touch(mid_x, mid_y);
 
-    drive(&mut fsm, &mut det, &scroll, &[start, mid, lift()]);
+    drive(&mut fsm, &mut det, &scroll, &[start, early, mid, lift()]);
     assert!(matches!(fsm.state(), FsmState::Debounce));
 
     drive(&mut fsm, &mut det, &scroll, &[touch(720, 500)]);

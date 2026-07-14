@@ -7,16 +7,17 @@
 //
 // 2. UinputTouchpad — virtual touchpad that mirrors the physical pad's
 //    capabilities. We grab the physical pad permanently at startup and
-//    forward its events through this device, suppressing position
-//    updates while the FSM is in Scrolling state. Libinput attaches to
-//    the virtual pad only, so it can never have stale state from a
-//    transient grab/ungrab cycle.
+//    forward its events through this device. Candidate circular frames
+//    are held until classified: replayed for pointer/multi-touch input,
+//    or discarded when circular scrolling captures the contact. Libinput
+//    attaches to the virtual pad only, so it can never have stale state
+//    from a transient grab/ungrab cycle.
 
 use std::path::Path;
 
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, Device, EventType, InputEvent, InputId, Key,
+    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, Device, EventType, InputEvent, InputId,
     PropType, RelativeAxisType, UinputAbsSetup,
 };
 use tracing::warn;
@@ -113,17 +114,7 @@ const TOUCHPAD_PRODUCT_ID: u16 = 0x7470; // ASCII "tp"
 
 pub struct UinputTouchpad {
     dev: VirtualDevice,
-    touch_release_keys: Vec<Key>,
 }
-
-const TOUCH_RELEASE_KEYS: [Key; 6] = [
-    Key::BTN_TOUCH,
-    Key::BTN_TOOL_FINGER,
-    Key::BTN_TOOL_DOUBLETAP,
-    Key::BTN_TOOL_TRIPLETAP,
-    Key::BTN_TOOL_QUADTAP,
-    Key::BTN_TOOL_QUINTTAP,
-];
 
 impl UinputTouchpad {
     /// Construct a virtual touchpad that mirrors `physical`'s
@@ -140,17 +131,6 @@ impl UinputTouchpad {
             "{} (letsnote-wheelpad)",
             physical.name().unwrap_or("Touchpad")
         );
-        let touch_release_keys = physical
-            .supported_keys()
-            .map(|keys| {
-                TOUCH_RELEASE_KEYS
-                    .iter()
-                    .copied()
-                    .filter(|key| keys.contains(*key))
-                    .collect()
-            })
-            .unwrap_or_default();
-
         let mut builder = VirtualDeviceBuilder::new()
             .map_err(|source| Error::UinputCreate { source })?
             .name(&name)
@@ -236,10 +216,7 @@ impl UinputTouchpad {
             .build()
             .map_err(|source| Error::UinputCreate { source })?;
 
-        Ok(Self {
-            dev,
-            touch_release_keys,
-        })
+        Ok(Self { dev })
     }
 
     /// Forward a batch of physical events to the virtual touchpad.
@@ -250,148 +227,33 @@ impl UinputTouchpad {
     /// its own. When `strip_positions` is true, ABS_X / ABS_Y /
     /// ABS_MT_POSITION_X / ABS_MT_POSITION_Y events are also dropped.
     pub fn forward(&mut self, events: &[InputEvent], strip_positions: bool) -> Result<()> {
-        self.emit_forward_events(prepare_forward_events(events, strip_positions, None, &[]))
-    }
-
-    /// Finish a captured circular gesture. Events for individual finger
-    /// lifts may have been suppressed while Scrolling owned the stream, so
-    /// prepend an explicit release for the slot that libinput saw before
-    /// capture and clear every touch-summary key supported by the physical
-    /// pad. Positions are stripped to avoid a cursor jump.
-    pub fn finish_scroll(&mut self, events: &[InputEvent], captured_slot: usize) -> Result<()> {
-        self.emit_forward_events(prepare_forward_events(
-            events,
-            true,
-            Some(captured_slot),
-            &self.touch_release_keys,
-        ))
-    }
-
-    fn emit_forward_events(&mut self, events: Vec<InputEvent>) -> Result<()> {
-        if events.is_empty() {
+        let filtered: Vec<InputEvent> = events
+            .iter()
+            .copied()
+            .filter(|ev| {
+                if ev.event_type() == EventType::SYNCHRONIZATION {
+                    return false;
+                }
+                if strip_positions && ev.event_type() == EventType::ABSOLUTE {
+                    let axis = AbsoluteAxisType(ev.code());
+                    if matches!(
+                        axis,
+                        AbsoluteAxisType::ABS_X
+                            | AbsoluteAxisType::ABS_Y
+                            | AbsoluteAxisType::ABS_MT_POSITION_X
+                            | AbsoluteAxisType::ABS_MT_POSITION_Y
+                    ) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+        if filtered.is_empty() {
             return Ok(());
         }
         self.dev
-            .emit(&events)
+            .emit(&filtered)
             .map_err(|source| Error::UinputWrite { source })
-    }
-}
-
-fn prepare_forward_events(
-    events: &[InputEvent],
-    strip_positions: bool,
-    release_slot: Option<usize>,
-    touch_release_keys: &[Key],
-) -> Vec<InputEvent> {
-    let finishing_scroll = release_slot.is_some();
-    let mut filtered = Vec::with_capacity(
-        events.len() + usize::from(finishing_scroll) * 2 + touch_release_keys.len(),
-    );
-    if let Some(slot) = release_slot {
-        filtered.push(InputEvent::new(
-            EventType::ABSOLUTE,
-            AbsoluteAxisType::ABS_MT_SLOT.0,
-            slot as i32,
-        ));
-        filtered.push(InputEvent::new(
-            EventType::ABSOLUTE,
-            AbsoluteAxisType::ABS_MT_TRACKING_ID.0,
-            -1,
-        ));
-    }
-    filtered.extend(events.iter().copied().filter(|ev| {
-        if ev.event_type() == EventType::SYNCHRONIZATION {
-            return false;
-        }
-        if strip_positions && ev.event_type() == EventType::ABSOLUTE {
-            let axis = AbsoluteAxisType(ev.code());
-            if matches!(
-                axis,
-                AbsoluteAxisType::ABS_X
-                    | AbsoluteAxisType::ABS_Y
-                    | AbsoluteAxisType::ABS_MT_POSITION_X
-                    | AbsoluteAxisType::ABS_MT_POSITION_Y
-            ) {
-                return false;
-            }
-            if finishing_scroll
-                && matches!(
-                    axis,
-                    AbsoluteAxisType::ABS_MT_SLOT | AbsoluteAxisType::ABS_MT_TRACKING_ID
-                )
-            {
-                // Only the captured contact was ever exposed to the
-                // virtual pad. Replace all physical MT slot releases with
-                // the single explicit release prepended above.
-                return false;
-            }
-        }
-        if finishing_scroll
-            && ev.event_type() == EventType::KEY
-            && touch_release_keys.iter().any(|key| key.code() == ev.code())
-        {
-            // Rebuild the summary-key releases below. Some transitions to
-            // zero may have occurred in suppressed intermediate frames.
-            return false;
-        }
-        true
-    }));
-    if finishing_scroll {
-        filtered.extend(
-            touch_release_keys
-                .iter()
-                .map(|key| InputEvent::new(EventType::KEY, key.code(), 0)),
-        );
-    }
-    filtered
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scroll_finish_releases_captured_slot_and_strips_positions() {
-        let physical_lift = [
-            InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_MT_SLOT.0, 1),
-            InputEvent::new(
-                EventType::ABSOLUTE,
-                AbsoluteAxisType::ABS_MT_POSITION_X.0,
-                700,
-            ),
-            InputEvent::new(
-                EventType::ABSOLUTE,
-                AbsoluteAxisType::ABS_MT_TRACKING_ID.0,
-                -1,
-            ),
-            InputEvent::new(EventType::KEY, Key::BTN_TOUCH.code(), 0),
-            InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
-        ];
-
-        let release_keys = [Key::BTN_TOUCH, Key::BTN_TOOL_FINGER];
-        let prepared = prepare_forward_events(&physical_lift, true, Some(0), &release_keys);
-        assert_eq!(prepared[0].code(), AbsoluteAxisType::ABS_MT_SLOT.0);
-        assert_eq!(prepared[0].value(), 0);
-        assert_eq!(prepared[1].code(), AbsoluteAxisType::ABS_MT_TRACKING_ID.0);
-        assert_eq!(prepared[1].value(), -1);
-        assert!(prepared.iter().all(|ev| {
-            ev.event_type() != EventType::SYNCHRONIZATION
-                && ev.code() != AbsoluteAxisType::ABS_MT_POSITION_X.0
-        }));
-        assert_eq!(
-            prepared
-                .iter()
-                .filter(|ev| {
-                    ev.event_type() == EventType::ABSOLUTE
-                        && ev.code() == AbsoluteAxisType::ABS_MT_TRACKING_ID.0
-                })
-                .count(),
-            1
-        );
-        for key in release_keys {
-            assert!(prepared.iter().any(|ev| {
-                ev.event_type() == EventType::KEY && ev.code() == key.code() && ev.value() == 0
-            }));
-        }
     }
 }
