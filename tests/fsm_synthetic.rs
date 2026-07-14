@@ -1,4 +1,4 @@
-// FSM synthetic tests — see linux-design.md §13.
+// Synthetic tests for gesture arbitration and FSM state transitions.
 
 use std::f64::consts::PI;
 
@@ -81,8 +81,8 @@ fn contact_to_idle_on_lift() {
 }
 
 #[test]
-fn contact_does_not_engage_on_cross_gate_movement_d020() {
-    // D-020: strict Windows dead-zone semantics. Once trapped in
+fn contact_does_not_engage_on_cross_gate_movement() {
+    // Under the strict Windows dead-zone semantics, once trapped in
     // Contact, even sliding outside the gate does not engage Moving.
     // The user must lift and re-touch.
     let mut fsm = Fsm::new(500, 500);
@@ -579,8 +579,8 @@ fn force_idle_resets_state() {
 
 #[test]
 fn debounce_to_idle_on_next_frame_no_timer() {
-    // D-011-followup: Debounce always exits to Idle on the next frame
-    // regardless of whether the finger is now down or up.
+    // Debounce always exits to Idle on the next frame regardless of
+    // whether the finger is now down or up.
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
@@ -605,10 +605,9 @@ fn debounce_to_idle_on_next_frame_no_timer() {
 
 #[test]
 fn debounce_to_idle_even_if_finger_back_down() {
-    // Per D-011-followup, the Debounce state has no re-engagement
-    // path. If a finger is down on the very next frame, we still go to
-    // Idle this frame; the frame *after* that re-runs the fresh-touch
-    // classifier.
+    // The Debounce state has no re-engagement path. If a finger is down
+    // on the very next frame, we still go to Idle this frame; the frame
+    // *after* that re-runs the fresh-touch classifier.
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
@@ -633,8 +632,8 @@ fn debounce_to_idle_even_if_finger_back_down() {
 
 #[test]
 fn disabled_scroll_holds_idle() {
-    // D-007: when scroll.enable = false the daemon keeps reading
-    // frames but the FSM never advances past Idle.
+    // When scroll.enable = false the daemon keeps reading frames, but
+    // the FSM never advances past Idle.
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let mut scroll = default_scroll();

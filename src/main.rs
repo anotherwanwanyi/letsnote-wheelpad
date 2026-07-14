@@ -17,7 +17,7 @@ use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
 
 /// 5 second watchdog — if the FSM has been Scrolling without consuming a
 /// packet for this long, force back to Idle so passthrough resumes and
-/// the cursor unfreezes. linux-design §14 risk 13.
+/// the cursor unfreezes.
 const SCROLLING_WATCHDOG: Duration = Duration::from_secs(5);
 
 /// Bound raw-frame buffering when an outer-ring contact produces many
@@ -108,7 +108,7 @@ fn run(args: Args) -> Result<()> {
     }
 
     // 6. Build the algorithm and FSM. History capacity is fixed at 20
-    //    to match Windows WheelPad exactly (D-021-followup).
+    //    to match Windows WheelPad exactly.
     let mut detector = CircularDetector::new();
     let mut fsm = Fsm::new(input.center_x, input.center_y);
 

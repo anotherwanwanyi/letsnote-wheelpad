@@ -1,6 +1,6 @@
 // Physical touchpad input — opens the evdev node, queries EVIOCGABS for
 // center coordinates, and turns the raw event stream into TouchFrames at
-// each SYN_REPORT. See linux-design.md §5.
+// each SYN_REPORT.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +12,7 @@ use crate::fsm::{TouchFrame, TrackedTouch};
 
 /// Maximum number of MT slots we track. The kernel exposes up to 10 in
 /// practice; touchpads typically advertise 5. We sweep all slots when
-/// rescanning for "lowest active" semantics (D-012), so the constant
+/// rescanning for "lowest active" semantics, so the constant
 /// only bounds the per-frame map size, not gesture logic.
 const MAX_MT_SLOTS: usize = 16;
 

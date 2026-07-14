@@ -1,4 +1,4 @@
-// Port of FUN_140005bf0 — see analysis/RE-findings.md §6 and analysis/linux-design.md §6.
+// Port of the Windows WheelPad circular-scrolling routine FUN_140005bf0.
 
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -18,10 +18,10 @@ pub const SAMPLE_DEADBAND_SQ: i64 = 64;
 pub const SENSITIVITY_TABLE: [i32; 7] = [5, 7, 10, 14, 20, 28, 40];
 
 /// Fixed at 20 to match Windows WheelPad exactly (DAT_14003cbec clamp at
-/// FUN_1400046a0 lines 65-67). The earlier design (D-021) scaled this
-/// from a startup-measured packet rate; hardware testing on the CF-SV2
-/// showed that scaling subtly changed scrolling startup feel, so we
-/// revert to Windows-faithful behaviour. See DECISIONS.md D-021-followup.
+/// FUN_1400046a0 lines 65-67). An earlier design scaled this from a
+/// startup-measured packet rate; hardware testing on the CF-SV2 showed
+/// that scaling subtly changed scrolling startup feel, so the fixed
+/// capacity preserves the Windows-faithful behaviour.
 pub const HISTORY_CAPACITY: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,12 +172,11 @@ impl CircularDetector {
         let v120 = exact_v120.round() as i32;
         self.v120_remainder = exact_v120 - v120 as f64;
 
-        // 4. WHILE-LOOP DRAIN — Linux deviation from Windows. See
-        //    DECISIONS.md D-006. Windows FUN_140005bf0 (lines 113-136) is
-        //    a single-pass branch that emits at most one tick per packet
-        //    and silently loses angle on fast sweeps; we drain fully so
-        //    that arbitrarily fast circles still scroll the proportional
-        //    amount.
+        // 4. WHILE-LOOP DRAIN — Linux deviation from Windows. The Windows
+        //    routine is a single-pass branch that emits at most one tick
+        //    per packet and silently loses angle on fast sweeps; we drain
+        //    fully so that arbitrarily fast circles still scroll the
+        //    proportional amount.
         //
         //    Sign convention preserved from Windows: positive accumulator
         //    overflow yields a tick value of -1. The user-visible
@@ -220,8 +219,7 @@ impl CircularDetector {
 
 /// Engagement gate — state 3 → state 4 transition test. Center-relative
 /// atan2 sweep from the engagement-start point to the current sample,
-/// with symmetric ±2π wrap (we deliberately use symmetric form across
-/// the daemon — see RE-findings.md §5 footnote on the asymmetric wrap).
+/// with symmetric ±2π wrap, matching the form used throughout the daemon.
 pub fn engagement_swept_angle(
     center_x: i32,
     center_y: i32,
@@ -262,8 +260,8 @@ pub fn radial_gate_ok(
 /// centered sample's atan2 lies within the configured wedge. Wraparound
 /// (`start > end`) is handled by splitting the test. Caller guarantees
 /// `horizontal_enable = true`; this function MUST NOT be called when
-/// horizontal scrolling is disabled (see linux-design.md §5 "Vertical
-/// scroll is NOT angle-gated").
+/// horizontal scrolling is disabled because vertical scrolling is never
+/// angle-gated.
 pub fn within_horizontal_arc(
     center_x: i32,
     center_y: i32,

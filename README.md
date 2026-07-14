@@ -1,6 +1,11 @@
 # letsnote-wheelpad
 
-> 日本語版は [README.ja.md](README.ja.md) を参照してください。
+> **Personal fork**
+>
+> This repository is a personal fork of
+> [Nerahikada/letsnote-wheelpad](https://github.com/Nerahikada/letsnote-wheelpad),
+> shared to make my changes available. It is not actively maintained and does
+> not provide official binary packages.
 
 A userland Linux daemon that reproduces the **Panasonic Let's Note "WheelPad"** circular touchpad scrolling behaviour. Draw a slow circle in the outer ring of your touchpad to scroll vertically — just like on Windows.
 
@@ -10,33 +15,19 @@ Works on Wayland and X11 by reading evdev events directly from the physical Syna
 
 `libinput` rejected adding circular scrolling to the Wayland-era stack (see Peter Hutterer's 2015 reasoning). So if you want your Let's Note's circular scroll to work on Linux, the only path is a userland daemon that reads the touchpad through evdev and emits wheel events through a separate virtual device. That's what this is.
 
-## Install
+## Changes in this fork
 
-### Ubuntu / Debian
+- Stop circular scrolling as soon as the finger stops moving instead of emitting residual scroll events.
+- Give ordinary multi-finger gestures priority before circular scrolling is captured, while keeping an already captured circular gesture stable.
+- Classify circular intent early while withholding candidate frames, avoiding the initial pointer twitch without making recognition needlessly insensitive.
+- Emit high-resolution wheel events for smoother scrolling and provide two extra-low sensitivity levels.
 
-```sh
-sudo dpkg -i letsnote-wheelpad_0.1.0_amd64.deb
-systemctl --user enable --now letsnote-wheelpad.service
-```
+## Build and install from source
 
-### Fedora / RHEL
-
-```sh
-sudo rpm -i letsnote-wheelpad-0.1.0-1.x86_64.rpm
-systemctl --user enable --now letsnote-wheelpad.service
-```
-
-### Arch
+This fork does not publish Debian, RPM, or AUR packages.
 
 ```sh
-yay -S letsnote-wheelpad      # AUR
-systemctl --user enable --now letsnote-wheelpad.service
-```
-
-### From source
-
-```sh
-git clone https://github.com/Nerahikada/letsnote-wheelpad
+git clone https://github.com/anotherwanwanyi/letsnote-wheelpad.git
 cd letsnote-wheelpad
 cargo build --release
 sudo install -Dm755 target/release/letsnote-wheelpad /usr/bin/letsnote-wheelpad
@@ -89,7 +80,7 @@ level = "info"  # trace | debug | info | warn | error
 journalctl --user -u letsnote-wheelpad -f
 ```
 
-If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the config (-4..+2). The daemon does not auto-calibrate — history capacity is fixed at 20 slots to match Windows exactly (see DECISIONS.md D-021-followup).
+If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the config (-4..+2). The daemon does not auto-calibrate — history capacity is fixed at 20 slots to match the Windows behaviour.
 
 ### High-resolution scrolling
 
@@ -117,7 +108,7 @@ In short: multi-finger input wins before circular capture; an already captured c
 
 The daemon takes exclusive ownership of the physical touchpad at startup (`EVIOCGRAB`, held forever) and creates two virtual `uinput` devices that libinput attaches to instead: a touchpad mirror (same capabilities as the physical pad) and a wheel. A 7-state FSM (`Idle`, `Contact`, `Moving`, `MultiTouch`, `Passthrough`, `Scrolling`, `Debounce`) arbitrates input. Ordinary events are forwarded verbatim; an outer-ring single-finger candidate is the exception, with complete frames held while `Moving` classifies its early trajectory. A pointer or multi-finger decision replays those frames in order, while a circular decision discards them and suppresses the rest of that physical contact stream. The circular detector is preheated with the candidate samples, then integrates chord-direction angles into fractional v120 high-resolution movement while retaining legacy whole-notch output for compatibility. Since a captured touch never reaches the virtual touchpad at all, it produces neither an initial cursor jump nor stale libinput contact state at all-up.
 
-For the full algorithm details and the architectural pivot history — see `DECISIONS.md` (D-022 is the passthrough decision; D-008..D-021 are the algorithm choices) and the analysis docs alongside the source.
+The circular detector and gesture arbitration are covered by the synthetic tests in `tests/algorithm_synthetic.rs` and `tests/fsm_synthetic.rs`.
 
 ## License
 
@@ -125,6 +116,7 @@ MIT. See [LICENSE](LICENSE).
 
 ## Acknowledgements
 
+- [Nerahikada](https://github.com/Nerahikada) for the original Linux implementation this repository is forked from.
 - Panasonic for the original WheelPad design, which this ports.
 - The X.Org `xf86-input-synaptics` project for the angle-of-point-about-a-center reference implementation we compared against during reverse engineering.
 - Peter Hutterer for the [2015 libinput discussion](https://gitlab.freedesktop.org/libinput/libinput/-/issues/) that explained why this had to be a daemon and not a libinput patch.

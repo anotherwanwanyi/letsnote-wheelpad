@@ -46,10 +46,10 @@ impl Default for Config {
 
 impl Default for Scroll {
     fn default() -> Self {
-        // Defaults verbatim from WheelPad.exe — see RE-findings.md §3 and
-        // DECISIONS.md D-008..D-010. Sensitivity index 0 selects the
-        // multiplier 20 of [5, 7, 10, 14, 20, 28, 40]. The two lowest
-        // entries are Linux extensions for smoother slow scrolling.
+        // Defaults derived from the observed WheelPad.exe behaviour.
+        // Sensitivity index 0 selects the multiplier 20 of
+        // [5, 7, 10, 14, 20, 28, 40]. The two lowest entries are Linux
+        // extensions for smoother slow scrolling.
         Self {
             enable: true,
             reverse_vertical: false,

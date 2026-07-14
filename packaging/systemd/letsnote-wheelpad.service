@@ -1,6 +1,6 @@
 [Unit]
 Description=Let's Note WheelPad (circular touchpad scroll)
-Documentation=https://github.com/Nerahikada/letsnote-wheelpad
+Documentation=https://github.com/anotherwanwanyi/letsnote-wheelpad
 After=graphical-session.target
 PartOf=graphical-session.target
 

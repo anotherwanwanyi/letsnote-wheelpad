@@ -42,8 +42,7 @@ pub enum FsmState {
     // effectively unreachable on Windows, real Windows users do not
     // experience debounce-based quick relift. We mirror that: enter
     // Debounce on lift and exit to Idle on the very next frame, with no
-    // timer check. We deliberately do NOT expose a TOML knob for this —
-    // see DECISIONS.md D-011-followup.
+    // timer check. We deliberately do NOT expose a TOML knob for this.
     Debounce,
 }
 
@@ -127,7 +126,7 @@ impl Fsm {
         scroll: &Scroll,
     ) -> Action {
         // Master gate. If scrolling is disabled at the config level we
-        // still consume frames so the daemon stays alive (D-007), but
+        // still consume frames so the daemon stays alive, but
         // never advance past Idle and never emit ticks.
         if !scroll.enable {
             self.state = FsmState::Idle;
@@ -165,12 +164,11 @@ impl Fsm {
                 Action::None
             }
 
-            // ---------- Contact (state 2) — dead-zone trap (D-020) ----------
+            // ---------- Contact (state 2) — dead-zone trap ----------
             FsmState::Contact { .. } if !has_contact => {
                 // Finger lifted. Per FUN_1400046a0 case 2 lines 118-126,
                 // Contact only exits to Idle on lift; cross-gate movement
-                // while in Contact does NOT transition to Moving. See
-                // DECISIONS.md D-020.
+                // while in Contact does NOT transition to Moving.
                 self.state = FsmState::Idle;
                 Action::None
             }
@@ -290,9 +288,8 @@ impl Fsm {
             // ---------- Debounce (state 5) — structural marker only ----------
             FsmState::Debounce => {
                 // Always transition to Idle on the next frame, regardless
-                // of whether the finger is now down or up. See
-                // DECISIONS.md D-011-followup and the comment on
-                // FsmState::Debounce above.
+                // of whether the finger is now down or up. See the comment
+                // on FsmState::Debounce above.
                 self.state = FsmState::Idle;
                 Action::None
             }
@@ -416,8 +413,7 @@ fn wrap_angle(mut angle: f64) -> f64 {
 
 /// Apply reverse flags and the arc gate, then return the appropriate
 /// EmitWheelV / EmitWheelH action. The horizontal arc is only consulted
-/// when `horizontal_enable = true` — vertical scroll is never angle-gated
-/// (linux-design.md §5 "Vertical scroll is NOT angle-gated").
+/// when `horizontal_enable = true`; vertical scroll is never angle-gated.
 fn emit(
     delta: WheelDelta,
     scroll: &Scroll,

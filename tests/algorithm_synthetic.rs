@@ -1,4 +1,4 @@
-// Synthetic tests for the CircularDetector — see linux-design.md §13.
+// Synthetic tests for the circular scrolling detector.
 
 use std::f64::consts::PI;
 
@@ -66,7 +66,7 @@ fn full_clockwise_circle_emits_negative_ticks() {
     // A clockwise circle in screen-Y-down integrates positive radians;
     // positive overflow returns negative ticks (Windows internal sign
     // convention). Passing the value through to uinput unchanged
-    // scrolls DOWN — matching the worked example in linux-design.md §6.
+    // scrolls DOWN according to the detector's internal sign convention.
     let samples = circle_samples(500, 500, 200.0, 0.0, 2.0 * PI, 40);
     let total = run_gesture(&samples, 0);
     assert!(
