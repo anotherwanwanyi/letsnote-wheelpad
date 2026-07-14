@@ -148,10 +148,13 @@ impl Fsm {
                         // Feed the engaging sample so the first tick can
                         // emit on this very frame if the gesture is fast
                         // enough.
-                        detector.push_if_moved(s);
-                        let ticks = detector.step(scroll.sensitivity);
-                        if ticks != 0 {
-                            emit(ticks, scroll, self.center_x, self.center_y, s)
+                        if detector.push_if_moved(s) {
+                            let ticks = detector.step(scroll.sensitivity);
+                            if ticks != 0 {
+                                emit(ticks, scroll, self.center_x, self.center_y, s)
+                            } else {
+                                Action::None
+                            }
                         } else {
                             Action::None
                         }
@@ -172,10 +175,13 @@ impl Fsm {
                 Action::None
             }
             (FsmState::Scrolling, true, Some(s)) => {
-                detector.push_if_moved(s);
-                let ticks = detector.step(scroll.sensitivity);
-                if ticks != 0 {
-                    emit(ticks, scroll, self.center_x, self.center_y, s)
+                if detector.push_if_moved(s) {
+                    let ticks = detector.step(scroll.sensitivity);
+                    if ticks != 0 {
+                        emit(ticks, scroll, self.center_x, self.center_y, s)
+                    } else {
+                        Action::None
+                    }
                 } else {
                     Action::None
                 }

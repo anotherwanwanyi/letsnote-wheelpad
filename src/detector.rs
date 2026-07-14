@@ -54,12 +54,17 @@ impl CircularDetector {
     /// Mirrors FUN_1400046a0 line 62. The 20-unit dead band is computed
     /// against the **previously stored sample**, not the engagement-start
     /// point — this is one of the verified corrections.
-    pub fn push_if_moved(&mut self, s: TouchSample) {
+    ///
+    /// Returns `true` only when `s` was added to the history. Callers must
+    /// not run [`Self::step`] when this returns `false`: doing so would
+    /// integrate the same curvature history again for every stationary
+    /// touch frame and generate scroll ticks after the finger has stopped.
+    pub fn push_if_moved(&mut self, s: TouchSample) -> bool {
         if let Some(prev) = self.last_stored {
             let dx = (s.x - prev.x) as i64;
             let dy = (s.y - prev.y) as i64;
             if dx * dx + dy * dy <= SAMPLE_DEADBAND_SQ {
-                return;
+                return false;
             }
         }
         self.last_stored = Some(s);
@@ -67,6 +72,7 @@ impl CircularDetector {
             self.history.pop_back();
         }
         self.history.push_front(s);
+        true
     }
 
     /// FUN_140005bf0 ported with all seven verification-pass corrections

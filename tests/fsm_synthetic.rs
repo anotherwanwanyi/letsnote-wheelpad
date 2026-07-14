@@ -155,6 +155,44 @@ fn scrolling_to_debounce_on_lift() {
 }
 
 #[test]
+fn stationary_frames_after_scrolling_do_not_emit_more_ticks() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    // Ten-degree steps at r=220 are farther apart than the detector's
+    // 20-unit sample deadband. The first 20 degrees engage Scrolling;
+    // the remaining arc fills the curvature history and emits ticks.
+    let moving_frames: Vec<_> = (0..=18)
+        .map(|i| {
+            let theta = i as f64 * PI / 18.0;
+            touch(
+                500 + (220.0 * theta.cos()).round() as i32,
+                500 + (220.0 * theta.sin()).round() as i32,
+            )
+        })
+        .collect();
+    let moving_actions = drive(&mut fsm, &mut det, &scroll, &moving_frames);
+    assert!(matches!(fsm.state(), FsmState::Scrolling));
+    assert!(
+        !moving_actions.is_empty(),
+        "the setup gesture must emit at least one scroll tick"
+    );
+
+    // Real touchpads may continue sending SYN_REPORT frames with the same
+    // coordinates (or sub-deadband jitter) while a finger rests on them.
+    // Those frames must not re-integrate the unchanged curvature history.
+    let stationary = *moving_frames.last().unwrap();
+    let stationary_frames = vec![stationary; 100];
+    let stationary_actions = drive(&mut fsm, &mut det, &scroll, &stationary_frames);
+    assert!(
+        stationary_actions.is_empty(),
+        "stationary frames unexpectedly emitted {stationary_actions:?}"
+    );
+    assert!(matches!(fsm.state(), FsmState::Scrolling));
+}
+
+#[test]
 fn force_idle_resets_state() {
     // Watchdog path: after force_idle the FSM is back at Idle even if
     // it was mid-Scrolling.

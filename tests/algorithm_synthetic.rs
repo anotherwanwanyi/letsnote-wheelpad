@@ -34,10 +34,31 @@ fn run_gesture(samples: &[TouchSample], sensitivity: i32) -> i32 {
     d.on_gesture_start();
     let mut total = 0_i32;
     for s in samples {
-        d.push_if_moved(*s);
-        total += d.step(sensitivity);
+        if d.push_if_moved(*s) {
+            total += d.step(sensitivity);
+        }
     }
     total
+}
+
+#[test]
+fn push_if_moved_reports_deadband_and_stationary_samples() {
+    let mut d = CircularDetector::new();
+    let start = TouchSample { x: 100, y: 100 };
+
+    assert!(d.push_if_moved(start), "the first sample must be stored");
+    assert!(
+        !d.push_if_moved(start),
+        "an identical stationary sample must be rejected"
+    );
+    assert!(
+        !d.push_if_moved(TouchSample { x: 120, y: 100 }),
+        "movement exactly on the 20-unit deadband must be rejected"
+    );
+    assert!(
+        d.push_if_moved(TouchSample { x: 121, y: 100 }),
+        "movement past the deadband must be stored"
+    );
 }
 
 #[test]
@@ -141,8 +162,9 @@ fn sign_convention_positive_overflow_yields_negative_tick() {
     let mut d = CircularDetector::new();
     d.on_gesture_start();
     for s in circle_samples(500, 500, 200.0, 0.0, 0.5, 5) {
-        d.push_if_moved(s);
-        let _ = d.step(0);
+        if d.push_if_moved(s) {
+            let _ = d.step(0);
+        }
     }
     d.set_accumulator_for_test(PI + 0.01);
     let ticks = d.step(0);
