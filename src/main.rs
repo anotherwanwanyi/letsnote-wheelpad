@@ -118,7 +118,7 @@ fn run(args: Args) -> Result<()> {
         // While scrolling, cap the wait so the watchdog can fire when
         // packet flow truly stalls (not when a long deliberate scroll
         // is in progress — last_packet_at is reset on every frame).
-        let timeout_ms: i32 = if matches!(fsm.state(), FsmState::Scrolling) {
+        let timeout_ms: i32 = if fsm.is_scrolling() {
             let remaining = SCROLLING_WATCHDOG.saturating_sub(last_packet_at.elapsed());
             remaining.as_millis() as i32
         } else {
@@ -141,9 +141,7 @@ fn run(args: Args) -> Result<()> {
         if n == 0 {
             // Timeout. Watchdog fires only if we've been stuck in
             // Scrolling without any packet for the full window.
-            if matches!(fsm.state(), FsmState::Scrolling)
-                && last_packet_at.elapsed() >= SCROLLING_WATCHDOG
-            {
+            if fsm.is_scrolling() && last_packet_at.elapsed() >= SCROLLING_WATCHDOG {
                 warn!("scrolling watchdog fired — forcing idle, resuming passthrough");
                 fsm.force_idle(&mut detector);
             }
@@ -175,7 +173,7 @@ fn run(args: Args) -> Result<()> {
             // stripping (lift batch), post tells us whether to forward
             // at all (suppress during Scrolling).
             let prev_state = fsm.state();
-            let action = fsm.step(pf.frame, &mut detector, &config.scroll);
+            let action = fsm.step(&pf.frame, &mut detector, &config.scroll);
             let now_state = fsm.state();
 
             match action {
@@ -197,14 +195,19 @@ fn run(args: Args) -> Result<()> {
             // Passthrough:
             //   post = Scrolling → suppress entirely (cursor frozen).
             //   pre = Scrolling && post != Scrolling → lift batch:
-            //          forward but strip position events, so libinput
-            //          sees BTN_TOUCH=0 / tracking_id=-1 without a
-            //          synthetic jump from the pre-engagement
-            //          coordinate.
+            //          release the originally captured MT slot, then
+            //          forward the batch with positions stripped, so
+            //          libinput sees a complete all-up transition without
+            //          a synthetic jump or a stale contact.
             //   otherwise → forward verbatim.
-            if !matches!(now_state, FsmState::Scrolling) {
-                let strip_positions = matches!(prev_state, FsmState::Scrolling);
-                if let Err(e) = vtouchpad.forward(&pf.events, strip_positions) {
+            if let FsmState::Scrolling { slot, .. } = prev_state {
+                if !matches!(now_state, FsmState::Scrolling { .. }) {
+                    if let Err(e) = vtouchpad.finish_scroll(&pf.events, slot) {
+                        warn!("virtual touchpad scroll cleanup failed: {e}");
+                    }
+                }
+            } else if !matches!(now_state, FsmState::Scrolling { .. }) {
+                if let Err(e) = vtouchpad.forward(&pf.events, false) {
                     warn!("virtual touchpad forward failed: {e}");
                 }
             }

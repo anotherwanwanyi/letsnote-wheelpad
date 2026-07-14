@@ -4,7 +4,7 @@
 
 A userland Linux daemon that reproduces the **Panasonic Let's Note "WheelPad"** circular touchpad scrolling behaviour. Draw a slow circle in the outer ring of your touchpad to scroll vertically — just like on Windows.
 
-Works on Wayland and X11 by reading evdev events directly from the physical Synaptics touchpad and emitting wheel events through a `uinput` virtual device. The physical pad keeps driving the cursor as normal; this daemon contributes scroll only.
+Works on Wayland and X11 by reading evdev events directly from the physical Synaptics touchpad and exposing two `uinput` devices: a mirrored touchpad for normal pointer and multi-finger input, plus a virtual wheel for circular scrolling.
 
 ## Why this exists
 
@@ -98,9 +98,19 @@ If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the conf
 - **Excel arrow-key fallback is gone.** Modern Excel routes horizontal wheel events natively; we don't need the Windows hack.
 - **No coasting/kinetic scrolling.** Matches the Windows WheelPad behaviour; xf86 has it but we don't.
 
+## Multi-finger gesture priority
+
+Circular scrolling is a single-finger gesture. Before it is captured, normal multi-finger gestures have priority:
+
+- If a second finger appears while circular scrolling is still a candidate, the daemon enters passthrough-only `MultiTouch` mode. All physical events continue to libinput, and circular recognition stays disabled until every finger has lifted. Removing only the second finger does not arm circular scrolling halfway through the same gesture.
+- Once circular scrolling has crossed its 15° engagement threshold, it owns that physical contact stream until all fingers lift. Fingers added after capture are not exposed to libinput, and the detector remains locked to the original tracking ID. If that original finger lifts first, another finger is never substituted into its circular trajectory.
+- On exit, the daemon explicitly releases the captured multitouch slot and clears every touch-summary key supported by the pad. This prevents a lift or finger-count transition suppressed during circular scrolling from leaving a stale or “ghost” contact in libinput.
+
+In short: multi-finger input wins before circular capture; an already captured circular gesture keeps ownership until all-up. The next contact sequence starts a fresh arbitration.
+
 ## How it works (one-paragraph version)
 
-The daemon takes exclusive ownership of the physical touchpad at startup (`EVIOCGRAB`, held forever) and creates two virtual `uinput` devices that libinput attaches to instead: a touchpad mirror (same capabilities as the physical pad) and a wheel. All physical touch events are forwarded verbatim to the virtual touchpad — so cursor, taps, clicks, and multi-finger gestures keep working exactly as before. When a 6-state FSM (`Idle → Contact → Moving → Scrolling → Debounce`) decides a finger is drawing a circle in the outer ring, we **suppress** the forwarding for that gesture's duration (cursor freezes, as desired) and integrate chord-direction angles into an accumulator. Each ±π crossing emits one wheel notch on the virtual wheel. When the finger lifts, we forward the lift event (with position stripped) so libinput sees a clean end-of-gesture without a synthetic cursor jump.
+The daemon takes exclusive ownership of the physical touchpad at startup (`EVIOCGRAB`, held forever) and creates two virtual `uinput` devices that libinput attaches to instead: a touchpad mirror (same capabilities as the physical pad) and a wheel. Outside a captured circular gesture, physical touch events are forwarded verbatim to the virtual touchpad — so cursor, taps, clicks, and multi-finger gestures keep working as before. A 6-state FSM (`Idle`, `Contact`, `Moving`, `MultiTouch`, `Scrolling`, `Debounce`) gives pre-capture multi-finger input priority. Once it decides a single finger is drawing a circle in the outer ring, forwarding is **suppressed** for that contact stream (cursor freezes, as desired) and chord-direction angles are integrated into an accumulator. Each ±π crossing emits one wheel notch on the virtual wheel. At all-up, position events are stripped, the captured MT slot is released, and touch-summary keys are cleared so libinput sees a clean end-of-gesture without a synthetic cursor jump or stale contact.
 
 For the full algorithm details and the architectural pivot history — see `DECISIONS.md` (D-022 is the passthrough decision; D-008..D-021 are the algorithm choices) and the analysis docs alongside the source.
 

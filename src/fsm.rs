@@ -10,9 +10,22 @@ use crate::detector::{
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FsmState {
     Idle,
-    Contact { origin: TouchSample },
-    Moving { engage_start: TouchSample },
-    Scrolling,
+    Contact {
+        origin: TouchSample,
+    },
+    Moving {
+        tracking_id: i32,
+        slot: usize,
+        engage_start: TouchSample,
+    },
+    /// Two or more contacts were observed before circular scrolling was
+    /// captured. Keep forwarding the physical stream to libinput and do
+    /// not reconsider circular scrolling until every finger has lifted.
+    MultiTouch,
+    Scrolling {
+        tracking_id: i32,
+        slot: usize,
+    },
     // The FSM has an explicit Debounce state to preserve the structure
     // of the original Windows WheelPad FSM (FUN_1400046a0 case 5).
     //
@@ -30,10 +43,18 @@ pub enum FsmState {
     Debounce,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackedTouch {
+    pub slot: usize,
+    pub tracking_id: i32,
+    pub pos: TouchSample,
+}
+
+#[derive(Clone, Debug)]
 pub struct TouchFrame {
     pub contact: bool,
-    pub pos: Option<TouchSample>,
+    /// All active type-B multitouch slots, ordered by slot number.
+    pub touches: Vec<TrackedTouch>,
 }
 
 /// Side effects the FSM asks the runtime to perform. The runtime also
@@ -66,6 +87,10 @@ impl Fsm {
         self.state
     }
 
+    pub fn is_scrolling(&self) -> bool {
+        matches!(self.state, FsmState::Scrolling { .. })
+    }
+
     /// Advance the FSM by one touch frame. Mutates the supplied detector
     /// (which holds the chord-angle accumulator and 20-unit-dead-band
     /// shift register) and the scroll config. Returns the (at most one)
@@ -77,7 +102,7 @@ impl Fsm {
     /// flow through this return value any more.
     pub fn step(
         &mut self,
-        frame: TouchFrame,
+        frame: &TouchFrame,
         detector: &mut CircularDetector,
         scroll: &Scroll,
     ) -> Action {
@@ -89,10 +114,18 @@ impl Fsm {
             return Action::None;
         }
 
-        match (self.state, frame.contact, frame.pos) {
+        let has_contact = frame.contact && !frame.touches.is_empty();
+
+        match self.state {
             // ---------- Idle (state 1) ----------
-            (FsmState::Idle, false, _) | (FsmState::Idle, true, None) => Action::None,
-            (FsmState::Idle, true, Some(s)) => {
+            FsmState::Idle if !has_contact => Action::None,
+            FsmState::Idle if frame.touches.len() > 1 => {
+                self.state = FsmState::MultiTouch;
+                Action::None
+            }
+            FsmState::Idle => {
+                let touch = frame.touches[0];
+                let s = touch.pos;
                 // Fresh touch-down: radial-gate classifier (FUN_140005a00).
                 if radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
                     // Outside dead zone → MOVING. Capture engage_start
@@ -102,7 +135,11 @@ impl Fsm {
                     // are NOT reset here; that happens on the
                     // Moving → Scrolling transition (mirroring
                     // FUN_1400046a0 line 151 which zeros DAT_14003cb00).
-                    self.state = FsmState::Moving { engage_start: s };
+                    self.state = FsmState::Moving {
+                        tracking_id: touch.tracking_id,
+                        slot: touch.slot,
+                        engage_start: s,
+                    };
                 } else {
                     // Inside dead zone → CONTACT (trap).
                     self.state = FsmState::Contact { origin: s };
@@ -111,7 +148,7 @@ impl Fsm {
             }
 
             // ---------- Contact (state 2) — dead-zone trap (D-020) ----------
-            (FsmState::Contact { .. }, false, _) => {
+            FsmState::Contact { .. } if !has_contact => {
                 // Finger lifted. Per FUN_1400046a0 case 2 lines 118-126,
                 // Contact only exits to Idle on lift; cross-gate movement
                 // while in Contact does NOT transition to Moving. See
@@ -119,18 +156,38 @@ impl Fsm {
                 self.state = FsmState::Idle;
                 Action::None
             }
-            (FsmState::Contact { .. }, true, _) => {
+            FsmState::Contact { .. } => {
                 // Stay trapped regardless of where the finger is now.
                 Action::None
             }
 
             // ---------- Moving (state 3) — engagement candidate ----------
-            (FsmState::Moving { .. }, false, _) | (FsmState::Moving { .. }, true, None) => {
+            FsmState::Moving { .. } if !has_contact => {
                 // Lift before engagement → Idle.
                 self.state = FsmState::Idle;
                 Action::None
             }
-            (FsmState::Moving { engage_start }, true, Some(s)) => {
+            FsmState::Moving { .. } if frame.touches.len() > 1 => {
+                // Multi-finger gestures take priority until every contact
+                // has lifted. This prevents a two-finger scroll or pinch
+                // from being captured later by the circular recognizer.
+                self.state = FsmState::MultiTouch;
+                Action::None
+            }
+            FsmState::Moving {
+                tracking_id,
+                slot,
+                engage_start,
+            } => {
+                let touch = frame.touches[0];
+                if touch.tracking_id != tracking_id {
+                    // One finger was replaced by another without an
+                    // all-up frame. Do not splice two physical contacts
+                    // into one candidate trajectory.
+                    self.state = FsmState::MultiTouch;
+                    return Action::None;
+                }
+                let s = touch.pos;
                 if !radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
                     // Slipped back into the dead zone — fall back to
                     // Contact (FUN_1400046a0 case 3, lines 127-137).
@@ -144,7 +201,7 @@ impl Fsm {
                         // The physical pad is already grabbed (forever);
                         // forwarding suppression is keyed off state.
                         detector.on_gesture_start();
-                        self.state = FsmState::Scrolling;
+                        self.state = FsmState::Scrolling { tracking_id, slot };
                         // Feed the engaging sample so the first tick can
                         // emit on this very frame if the gesture is fast
                         // enough.
@@ -166,19 +223,36 @@ impl Fsm {
                 }
             }
 
+            // ---------- MultiTouch — passthrough owns this contact set ----------
+            FsmState::MultiTouch if !has_contact => {
+                self.state = FsmState::Idle;
+                Action::None
+            }
+            FsmState::MultiTouch => Action::None,
+
             // ---------- Scrolling (state 4) ----------
-            (FsmState::Scrolling, false, _) | (FsmState::Scrolling, true, None) => {
+            FsmState::Scrolling { .. } if !has_contact => {
                 // Lift → Debounce. State change alone is enough for the
                 // passthrough runtime to resume forwarding the lift
                 // events to the virtual touchpad.
                 self.state = FsmState::Debounce;
                 Action::None
             }
-            (FsmState::Scrolling, true, Some(s)) => {
-                if detector.push_if_moved(s) {
+            FsmState::Scrolling { tracking_id, .. } => {
+                // Circular scrolling owns the stream once captured, even
+                // if more fingers are added. Continue following only the
+                // original tracking ID; never jump to a different slot.
+                let tracked = frame
+                    .touches
+                    .iter()
+                    .find(|touch| touch.tracking_id == tracking_id);
+                if let Some(touch) = tracked {
+                    if !detector.push_if_moved(touch.pos) {
+                        return Action::None;
+                    }
                     let ticks = detector.step(scroll.sensitivity);
                     if ticks != 0 {
-                        emit(ticks, scroll, self.center_x, self.center_y, s)
+                        emit(ticks, scroll, self.center_x, self.center_y, touch.pos)
                     } else {
                         Action::None
                     }
@@ -188,7 +262,7 @@ impl Fsm {
             }
 
             // ---------- Debounce (state 5) — structural marker only ----------
-            (FsmState::Debounce, _, _) => {
+            FsmState::Debounce => {
                 // Always transition to Idle on the next frame, regardless
                 // of whether the finger is now down or up. See
                 // DECISIONS.md D-011-followup and the comment on

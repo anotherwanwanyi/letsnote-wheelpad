@@ -8,7 +8,7 @@ use evdev::{AbsoluteAxisType, Device, EventType, InputEvent, Key};
 
 use crate::detector::TouchSample;
 use crate::error::{Error, Result};
-use crate::fsm::TouchFrame;
+use crate::fsm::{TouchFrame, TrackedTouch};
 
 /// Maximum number of MT slots we track. The kernel exposes up to 10 in
 /// practice; touchpads typically advertise 5. We sweep all slots when
@@ -219,25 +219,26 @@ impl InputDevice {
     }
 
     fn assemble_frame(&mut self) -> TouchFrame {
-        // Lowest-numbered active slot wins (D-012). "Active" = tracking_id != -1.
-        let chosen = self
+        // Keep every active slot so the FSM can arbitrate one-finger
+        // circular scrolling against two- and multi-finger libinput
+        // gestures, and lock a captured gesture to its tracking ID.
+        let touches = self
             .slots
             .iter()
             .enumerate()
-            .find(|(_, s)| s.tracking_id != -1);
-        match (self.contact, chosen) {
-            (true, Some((_, s))) => TouchFrame {
-                contact: true,
-                pos: Some(TouchSample { x: s.x, y: s.y }),
-            },
-            (true, None) => TouchFrame {
-                contact: true,
-                pos: None,
-            },
-            (false, _) => TouchFrame {
-                contact: false,
-                pos: None,
-            },
+            .filter(|(_, state)| state.tracking_id != -1)
+            .map(|(slot, state)| TrackedTouch {
+                slot,
+                tracking_id: state.tracking_id,
+                pos: TouchSample {
+                    x: state.x,
+                    y: state.y,
+                },
+            })
+            .collect();
+        TouchFrame {
+            contact: self.contact,
+            touches,
         }
     }
 }
