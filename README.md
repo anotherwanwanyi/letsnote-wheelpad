@@ -22,6 +22,8 @@ Works on Wayland and X11 by reading evdev events directly from the physical Syna
 - Classify circular intent early while withholding candidate frames, avoiding the initial pointer twitch without making recognition needlessly insensitive.
 - Emit high-resolution wheel events for smoother scrolling and provide two extra-low sensitivity levels.
 
+These changes were tested on a Panasonic Let's Note CF-FV1 running Arch Linux. This is provided for reference only and does not imply compatibility with other models.
+
 ## Build and install from source
 
 This fork does not publish Debian, RPM, or AUR packages.
