@@ -45,7 +45,8 @@ systemctl --user enable --now letsnote-wheelpad.service
 Configuration lives in `~/.config/letsnote-wheelpad/config.toml`. All keys are optional; defaults match the Windows out-of-box behaviour.
 
 ```toml
-# Auto-detected by name regex. Override only if you have a non-standard pad.
+# Auto-detected by evdev name. See "Using a differently named touchpad"
+# below if detection fails.
 # device = "/dev/input/event4"
 # device_name_regex = "Synaptics.*TM3562"
 
@@ -62,6 +63,45 @@ horizontal_end       = 6      # arc end in π/8 units (6 → 135°)
 [log]
 level = "info"  # trace | debug | info | warn | error
 ```
+
+### Using a differently named touchpad
+
+If automatic detection fails, list the evdev device names and paths:
+
+```sh
+for event in /sys/class/input/event*; do
+    printf '%s: ' "/dev/input/${event##*/}"
+    cat "$event/device/name"
+done
+```
+
+Choose a distinctive part of the physical touchpad name and add a top-level pattern before `[scroll]` in the config file:
+
+```toml
+device_name_regex = "UNIQUE PART OF THE TOUCHPAD NAME"
+
+[scroll]
+# ...
+```
+
+The daemon also needs permission to open the device. Create a local udev rule at `/etc/udev/rules.d/71-letsnote-wheelpad-local.rules`:
+
+```udev
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*UNIQUE PART OF THE TOUCHPAD NAME*", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+```
+
+Then reload the rules and restart the daemon:
+
+```sh
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+systemctl --user restart letsnote-wheelpad.service
+```
+
+`device_name_regex` uses regular-expression syntax, while `ATTRS{name}` in the udev rule uses glob syntax. Make the selected name fragment specific enough not to match another input device.
+
+### Configuration reference
 
 | Key | Default | Range | Notes |
 | --- | --- | --- | --- |
@@ -89,7 +129,7 @@ After circular intent is captured, every accepted curvature update produces a fr
 ## Known issues / non-goals
 
 - **`WheelUnderCursor` is not configurable.** On Wayland the compositor routes input to the focused surface; there's no userland override.
-- **Only the Synaptics TM3562-3 family is tested.** Other touchpads may work with `device_name_regex` overrides, but no compatibility promises.
+- **Hardware coverage is limited.** Touchpads whose evdev names do not match the default pattern require the configuration and udev override described above. Compatibility with other hardware is not guaranteed.
 - **Excel arrow-key fallback is gone.** Modern Excel routes horizontal wheel events natively; we don't need the Windows hack.
 - **No coasting/kinetic scrolling.** Matches the Windows WheelPad behaviour; xf86 has it but we don't.
 
