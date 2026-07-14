@@ -4,7 +4,7 @@ use std::f64::consts::PI;
 
 use letsnote_wheelpad::detector::{
     engagement_swept_angle, radial_gate_ok, within_horizontal_arc, CircularDetector, TouchSample,
-    TRIGGER_ANGLE,
+    WheelDelta, TRIGGER_ANGLE,
 };
 
 /// Generate N samples around a circle. Y is screen-down, so a positive
@@ -29,10 +29,10 @@ fn circle_samples(
     out
 }
 
-fn run_gesture(samples: &[TouchSample], sensitivity: i32) -> i32 {
+fn run_gesture(samples: &[TouchSample], sensitivity: i32) -> WheelDelta {
     let mut d = CircularDetector::new();
     d.on_gesture_start();
-    let mut total = 0_i32;
+    let mut total = WheelDelta::default();
     for s in samples {
         if d.push_if_moved(*s) {
             total += d.step(sensitivity);
@@ -52,11 +52,11 @@ fn push_if_moved_reports_deadband_and_stationary_samples() {
         "an identical stationary sample must be rejected"
     );
     assert!(
-        !d.push_if_moved(TouchSample { x: 120, y: 100 }),
-        "movement exactly on the 20-unit deadband must be rejected"
+        !d.push_if_moved(TouchSample { x: 108, y: 100 }),
+        "movement exactly on the 8-unit deadband must be rejected"
     );
     assert!(
-        d.push_if_moved(TouchSample { x: 121, y: 100 }),
+        d.push_if_moved(TouchSample { x: 109, y: 100 }),
         "movement past the deadband must be stored"
     );
 }
@@ -70,13 +70,14 @@ fn full_clockwise_circle_emits_negative_ticks() {
     let samples = circle_samples(500, 500, 200.0, 0.0, 2.0 * PI, 40);
     let total = run_gesture(&samples, 0);
     assert!(
-        total < 0,
-        "clockwise circle should produce negative ticks (got {total})"
+        total.discrete < 0,
+        "clockwise circle should produce negative ticks (got {total:?})"
     );
     assert!(
-        total.abs() >= 1,
+        total.discrete.abs() >= 1,
         "full circle should produce at least one tick"
     );
+    assert!(total.v120 < 0, "clockwise v120 must have the same sign");
 }
 
 #[test]
@@ -84,9 +85,10 @@ fn full_counterclockwise_circle_emits_positive_ticks() {
     let samples = circle_samples(500, 500, 200.0, 0.0, -2.0 * PI, 40);
     let total = run_gesture(&samples, 0);
     assert!(
-        total > 0,
-        "counterclockwise circle should produce positive ticks (got {total})"
+        total.discrete > 0,
+        "counterclockwise circle should produce positive ticks (got {total:?})"
     );
+    assert!(total.v120 > 0);
 }
 
 #[test]
@@ -98,7 +100,11 @@ fn straight_line_produces_zero_ticks() {
         })
         .collect();
     let total = run_gesture(&samples, 0);
-    assert_eq!(total, 0, "straight line must not scroll");
+    assert_eq!(
+        total,
+        WheelDelta::default(),
+        "straight line must not scroll"
+    );
 }
 
 #[test]
@@ -132,17 +138,21 @@ fn zig_zag_does_not_engage() {
     .map(|(x, y)| TouchSample { x: *x, y: *y })
     .collect();
     let total = run_gesture(&zigs, 0);
-    assert_eq!(total, 0, "zig-zag should not produce ticks (got {total})");
+    assert_eq!(
+        total,
+        WheelDelta::default(),
+        "zig-zag should not produce wheel movement (got {total:?})"
+    );
 }
 
 #[test]
 fn half_circle_does_not_exceed_full() {
     let full = run_gesture(&circle_samples(500, 500, 200.0, 0.0, 2.0 * PI, 40), 0);
     let half = run_gesture(&circle_samples(500, 500, 200.0, 0.0, PI, 20), 0);
-    assert!(full < 0 && half < 0);
+    assert!(full.discrete < 0 && half.discrete < 0);
     assert!(
-        half.abs() <= full.abs(),
-        "half ({half}) should not exceed full ({full})"
+        half.discrete.abs() <= full.discrete.abs(),
+        "half ({half:?}) should not exceed full ({full:?})"
     );
 }
 
@@ -150,7 +160,7 @@ fn half_circle_does_not_exceed_full() {
 fn reverse_circle_has_opposite_sign() {
     let cw = run_gesture(&circle_samples(500, 500, 200.0, 0.0, 2.0 * PI, 40), 0);
     let ccw = run_gesture(&circle_samples(500, 500, 200.0, 0.0, -2.0 * PI, 40), 0);
-    assert!(cw < 0 && ccw > 0, "cw={cw} ccw={ccw}");
+    assert!(cw.discrete < 0 && ccw.discrete > 0, "cw={cw:?} ccw={ccw:?}");
 }
 
 #[test]
@@ -167,8 +177,74 @@ fn sign_convention_positive_overflow_yields_negative_tick() {
         }
     }
     d.set_accumulator_for_test(PI + 0.01);
-    let ticks = d.step(0);
-    assert_eq!(ticks, -1);
+    let delta = d.step(0);
+    assert_eq!(delta.discrete, -1);
+}
+
+#[test]
+fn high_resolution_movement_precedes_a_legacy_notch() {
+    // Three points are also the circular-intent minimum. The high-res path
+    // can use their first curvature delta without waiting for the legacy
+    // detector's five-point noise gate.
+    let samples = circle_samples(385, 385, 340.0, 0.0, 8.0 * PI / 180.0, 3);
+    let delta = run_gesture(&samples, 0);
+
+    assert_ne!(delta.v120, 0, "the early arc should emit a v120 fraction");
+    assert_eq!(
+        delta.discrete, 0,
+        "the same early arc should not yet emit a whole legacy notch"
+    );
+}
+
+#[test]
+fn stationary_pause_preserves_history_for_high_resolution_resume() {
+    let mut detector = CircularDetector::new();
+    let initial = circle_samples(385, 385, 340.0, 0.0, 8.0 * PI / 180.0, 3);
+    let mut initial_delta = WheelDelta::default();
+    for sample in &initial {
+        if detector.push_if_moved(*sample) {
+            initial_delta += detector.step(0);
+        }
+    }
+    assert_ne!(initial_delta.v120, 0);
+
+    let stationary = *initial.last().unwrap();
+    for _ in 0..100 {
+        assert!(!detector.push_if_moved(stationary));
+    }
+
+    let resumed = circle_samples(385, 385, 340.0, 10.0 * PI / 180.0, 0.0, 1)[0];
+    assert!(detector.push_if_moved(resumed));
+    let resumed_delta = detector.step(0);
+    assert_ne!(
+        resumed_delta.v120, 0,
+        "resuming the same contact should not refill detector history"
+    );
+}
+
+#[test]
+fn sub_v120_rounding_residue_is_not_lost() {
+    // Each accepted step contributes less than half a v120 unit at the
+    // lowest sensitivity. Retained floating-point residue must still turn
+    // many such steps into visible integer high-resolution movement.
+    let samples = circle_samples(0, 0, 5000.0, 0.0, 0.2, 101);
+    let delta = run_gesture(&samples, -4);
+
+    assert!(
+        (-20..=-17).contains(&delta.v120),
+        "unexpected accumulated fractional movement: {delta:?}"
+    );
+    assert_eq!(delta.discrete, 0);
+}
+
+#[test]
+fn extended_low_sensitivity_reduces_high_resolution_distance() {
+    let samples = circle_samples(500, 500, 200.0, 0.0, PI, 40);
+    let lowest = run_gesture(&samples, -4);
+    let previous_lowest = run_gesture(&samples, -2);
+
+    assert!(lowest.v120.abs() < previous_lowest.v120.abs());
+    assert!(lowest.v120.abs() * 2 <= previous_lowest.v120.abs() + 1);
 }
 
 #[test]

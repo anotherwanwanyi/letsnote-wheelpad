@@ -186,17 +186,25 @@ fn run(args: Args) -> Result<()> {
 
             match action {
                 Action::None => {}
-                Action::EmitWheelV(t) => {
-                    if let Err(e) = vwheel.emit_v(t) {
+                Action::EmitWheelV(delta) => {
+                    if let Err(e) = vwheel.emit_v(delta) {
                         warn!("uinput emit_v failed: {e}");
                     }
-                    debug!(ticks = t, "emit vertical");
+                    debug!(
+                        v120 = delta.v120,
+                        discrete = delta.discrete,
+                        "emit vertical"
+                    );
                 }
-                Action::EmitWheelH(t) => {
-                    if let Err(e) = vwheel.emit_h(t) {
+                Action::EmitWheelH(delta) => {
+                    if let Err(e) = vwheel.emit_h(delta) {
                         warn!("uinput emit_h failed: {e}");
                     }
-                    debug!(ticks = t, "emit horizontal");
+                    debug!(
+                        v120 = delta.v120,
+                        discrete = delta.discrete,
+                        "emit horizontal"
+                    );
                 }
             }
 

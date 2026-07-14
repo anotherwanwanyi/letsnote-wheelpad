@@ -6,7 +6,7 @@ use std::f64::consts::PI;
 use crate::config::Scroll;
 use crate::detector::{
     engagement_swept_angle, radial_gate_ok, within_horizontal_arc, CircularDetector, TouchSample,
-    TRIGGER_ANGLE,
+    WheelDelta, TRIGGER_ANGLE,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,8 +67,8 @@ pub struct TouchFrame {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     None,
-    EmitWheelV(i32),
-    EmitWheelH(i32),
+    EmitWheelV(WheelDelta),
+    EmitWheelH(WheelDelta),
 }
 
 pub struct Fsm {
@@ -113,9 +113,9 @@ impl Fsm {
     }
 
     /// Advance the FSM by one touch frame. Mutates the supplied detector
-    /// (which holds the chord-angle accumulator and 20-unit-dead-band
-    /// shift register) and the scroll config. Returns the (at most one)
-    /// wheel-emission action the runtime needs to perform.
+    /// (which holds the chord-angle accumulator, v120 rounding residue,
+    /// and position history) and the scroll config. Returns the (at most
+    /// one) wheel-emission action the runtime needs to perform.
     ///
     /// The runtime derives event-forwarding decisions from the states
     /// immediately before and after this call; no grab/release actions
@@ -225,15 +225,15 @@ impl Fsm {
                             // sample instead of throwing away the motion
                             // that established circular intent.
                             detector.on_gesture_start();
-                            let mut ticks = 0;
+                            let mut delta = WheelDelta::default();
                             for sample in self.intent_samples.drain(..) {
                                 if detector.push_if_moved(sample) {
-                                    ticks += detector.step(scroll.sensitivity);
+                                    delta += detector.step(scroll.sensitivity);
                                 }
                             }
                             self.state = FsmState::Scrolling { tracking_id, slot };
-                            if ticks != 0 {
-                                emit(ticks, scroll, self.center_x, self.center_y, s)
+                            if !delta.is_zero() {
+                                emit(delta, scroll, self.center_x, self.center_y, s)
                             } else {
                                 Action::None
                             }
@@ -276,9 +276,9 @@ impl Fsm {
                     if !detector.push_if_moved(touch.pos) {
                         return Action::None;
                     }
-                    let ticks = detector.step(scroll.sensitivity);
-                    if ticks != 0 {
-                        emit(ticks, scroll, self.center_x, self.center_y, touch.pos)
+                    let delta = detector.step(scroll.sensitivity);
+                    if !delta.is_zero() {
+                        emit(delta, scroll, self.center_x, self.center_y, touch.pos)
                     } else {
                         Action::None
                     }
@@ -418,7 +418,13 @@ fn wrap_angle(mut angle: f64) -> f64 {
 /// EmitWheelV / EmitWheelH action. The horizontal arc is only consulted
 /// when `horizontal_enable = true` — vertical scroll is never angle-gated
 /// (linux-design.md §5 "Vertical scroll is NOT angle-gated").
-fn emit(ticks: i32, scroll: &Scroll, center_x: i32, center_y: i32, current: TouchSample) -> Action {
+fn emit(
+    delta: WheelDelta,
+    scroll: &Scroll,
+    center_x: i32,
+    center_y: i32,
+    current: TouchSample,
+) -> Action {
     if scroll.horizontal_enable
         && within_horizontal_arc(
             center_x,
@@ -429,16 +435,16 @@ fn emit(ticks: i32, scroll: &Scroll, center_x: i32, center_y: i32, current: Touc
         )
     {
         let signed = if scroll.reverse_horizontal {
-            -ticks
+            delta.reversed()
         } else {
-            ticks
+            delta
         };
         Action::EmitWheelH(signed)
     } else {
         let signed = if scroll.reverse_vertical {
-            -ticks
+            delta.reversed()
         } else {
-            ticks
+            delta
         };
         Action::EmitWheelV(signed)
     }

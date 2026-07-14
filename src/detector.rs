@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::f64::consts::PI;
+use std::ops::AddAssign;
 
 const PI2: f64 = 2.0 * PI;
 
@@ -11,8 +12,10 @@ const PI2: f64 = 2.0 * PI;
 pub const TRIGGER_ANGLE: f64 = PI / 24.0;
 pub const NOISE_REJECT_ANGLE: f64 = PI / 4.0;
 pub const ZONE_RADIANS: f64 = PI / 8.0;
-pub const SAMPLE_DEADBAND_SQ: i64 = 400;
-pub const SENSITIVITY_TABLE: [i32; 5] = [10, 14, 20, 28, 40];
+/// Eight device units keeps high-resolution updates frequent while still
+/// filtering coordinate quantisation and stationary reports.
+pub const SAMPLE_DEADBAND_SQ: i64 = 64;
+pub const SENSITIVITY_TABLE: [i32; 7] = [5, 7, 10, 14, 20, 28, 40];
 
 /// Fixed at 20 to match Windows WheelPad exactly (DAT_14003cbec clamp at
 /// FUN_1400046a0 lines 65-67). The earlier design (D-021) scaled this
@@ -27,10 +30,42 @@ pub struct TouchSample {
     pub y: i32,
 }
 
+/// One logical wheel update in both Linux representations.
+///
+/// `v120` is the high-resolution delta where 120 units equal one detent.
+/// `discrete` is the legacy whole-detent approximation. Consumers choose
+/// one stream; they must not add the two values together.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WheelDelta {
+    pub v120: i32,
+    pub discrete: i32,
+}
+
+impl WheelDelta {
+    pub fn is_zero(self) -> bool {
+        self.v120 == 0 && self.discrete == 0
+    }
+
+    pub fn reversed(self) -> Self {
+        Self {
+            v120: -self.v120,
+            discrete: -self.discrete,
+        }
+    }
+}
+
+impl AddAssign for WheelDelta {
+    fn add_assign(&mut self, rhs: Self) {
+        self.v120 += rhs.v120;
+        self.discrete += rhs.discrete;
+    }
+}
+
 pub struct CircularDetector {
     history: VecDeque<TouchSample>,
     last_stored: Option<TouchSample>,
     accumulator: f64,
+    v120_remainder: f64,
 }
 
 impl Default for CircularDetector {
@@ -45,6 +80,7 @@ impl CircularDetector {
             history: VecDeque::with_capacity(HISTORY_CAPACITY),
             last_stored: None,
             accumulator: 0.0,
+            v120_remainder: 0.0,
         }
     }
 
@@ -52,11 +88,13 @@ impl CircularDetector {
         self.history.clear();
         self.last_stored = None;
         self.accumulator = 0.0;
+        self.v120_remainder = 0.0;
     }
 
-    /// Mirrors FUN_1400046a0 line 62. The 20-unit dead band is computed
+    /// The movement dead band is computed
     /// against the **previously stored sample**, not the engagement-start
-    /// point — this is one of the verified corrections.
+    /// point. It was reduced from the Windows-faithful 20 units to 8 so a
+    /// resumed gesture can produce high-resolution updates promptly.
     ///
     /// Returns `true` only when `s` was added to the history. Callers must
     /// not run [`Self::step`] when this returns `false`: doing so would
@@ -78,15 +116,14 @@ impl CircularDetector {
         true
     }
 
-    /// FUN_140005bf0 ported with all seven verification-pass corrections
-    /// plus the deliberate while-loop drain (D-006). The return value is
-    /// the signed wheel-tick count: positive accumulator overflow returns
-    /// negative ticks, mirroring the Windows internal sign convention.
-    /// The user-facing reverse flip is applied later, in uinput.rs.
-    pub fn step(&mut self, scroll_speed_adjust: i32) -> i32 {
+    /// Integrate one stored sample into both high-resolution v120 movement
+    /// and the legacy whole-detent approximation. Positive curvature maps
+    /// to negative wheel movement, preserving the Windows sign convention.
+    /// The user-facing reverse flip is applied later, in the FSM.
+    pub fn step(&mut self, scroll_speed_adjust: i32) -> WheelDelta {
         let n = self.history.len();
         if n < 3 {
-            return 0;
+            return WheelDelta::default();
         }
 
         // 1. Per-pair motion-vector angles.
@@ -100,7 +137,8 @@ impl CircularDetector {
         // 2. Pairwise differences with ±2π wrap and history-truncating
         //    π/4 reject (FUN_140005bf0 lines 80-92).
         let mut sum = 0.0;
-        let mut valid = a.len() - 1;
+        let available = a.len() - 1;
+        let mut valid = available;
         for i in 0..a.len() - 1 {
             let mut d = a[i] - a[i + 1];
             if d > PI {
@@ -115,14 +153,24 @@ impl CircularDetector {
             }
             sum += d;
         }
-        if valid < 3 {
-            return 0;
+        // With only three or four stored points, the intent classifier has
+        // already established that this is a circle, so their one or two
+        // curvature deltas are useful for immediate high-resolution output.
+        // Once a longer history exists, keep the original three-delta gate:
+        // fewer valid deltas then means the π/4 noise reject truncated it.
+        if valid == 0 || (available >= 3 && valid < 3) {
+            return WheelDelta::default();
         }
 
-        // 3. Sensitivity-table-weighted mean accumulates into the global.
-        let idx = (scroll_speed_adjust.clamp(-2, 2) + 2) as usize;
+        // 3. Sensitivity-table-weighted mean. Convert the same continuous
+        // curvature into v120 fractions immediately, retaining sub-unit
+        // rounding residue across reports.
+        let idx = (scroll_speed_adjust.clamp(-4, 2) + 4) as usize;
         let sensitivity = SENSITIVITY_TABLE[idx] as f64;
-        self.accumulator += sensitivity * (sum / valid as f64);
+        let curvature_delta = sensitivity * (sum / valid as f64);
+        let exact_v120 = self.v120_remainder - curvature_delta * (120.0 / PI2);
+        let v120 = exact_v120.round() as i32;
+        self.v120_remainder = exact_v120 - v120 as f64;
 
         // 4. WHILE-LOOP DRAIN — Linux deviation from Windows. See
         //    DECISIONS.md D-006. Windows FUN_140005bf0 (lines 113-136) is
@@ -133,8 +181,8 @@ impl CircularDetector {
         //
         //    Sign convention preserved from Windows: positive accumulator
         //    overflow yields a tick value of -1. The user-visible
-        //    `WheelReverse` flip is applied at the emit layer
-        //    (uinput.rs), not here. A clockwise gesture (which integrates
+        //    reverse-direction flip is applied by the FSM, not here. A
+        //    clockwise gesture (which integrates
         //    positive in screen-Y-down coords) therefore returns negative
         //    ticks; passing the value through to uinput unchanged scrolls
         //    the page DOWN, matching Windows.
@@ -146,15 +194,21 @@ impl CircularDetector {
         //    note remains so future readers don't think the quirk was
         //    overlooked.
         let mut ticks: i32 = 0;
-        while self.accumulator > PI {
-            self.accumulator -= PI2;
-            ticks -= 1;
+        if valid >= 3 {
+            self.accumulator += curvature_delta;
+            while self.accumulator > PI {
+                self.accumulator -= PI2;
+                ticks -= 1;
+            }
+            while self.accumulator < -PI {
+                self.accumulator += PI2;
+                ticks += 1;
+            }
         }
-        while self.accumulator < -PI {
-            self.accumulator += PI2;
-            ticks += 1;
+        WheelDelta {
+            v120,
+            discrete: ticks,
         }
-        ticks
     }
 
     /// Test-only setter. Visible to integration tests under `tests/`.

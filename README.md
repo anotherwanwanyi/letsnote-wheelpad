@@ -63,7 +63,7 @@ enable               = true   # master enable
 reverse_vertical     = false  # flip vertical scroll direction
 horizontal_enable    = false  # enable bottom-edge horizontal-scroll wedge
 reverse_horizontal   = false
-sensitivity          = 0      # -2..+2 ; lower = less sensitive
+sensitivity          = 0      # -4..+2 ; lower = less sensitive
 detect_area_width    = 0      # 0..10 ; 0 = outer ring only, 10 = whole pad
 horizontal_start     = 2      # arc start in π/8 units (2 → 45°)
 horizontal_end       = 6      # arc end in π/8 units (6 → 135°)
@@ -78,7 +78,7 @@ level = "info"  # trace | debug | info | warn | error
 | `scroll.reverse_vertical` | `false` | bool | "Natural" scroll = `true`. |
 | `scroll.horizontal_enable` | `false` | bool | Off by default; same as Windows. |
 | `scroll.reverse_horizontal` | `false` | bool | |
-| `scroll.sensitivity` | `0` | -2..+2 | Indexes the multiplier table `[10, 14, 20, 28, 40]`. |
+| `scroll.sensitivity` | `0` | -4..+2 | Indexes the multiplier table `[5, 7, 10, 14, 20, 28, 40]`; `-4` and `-3` are extra-low Linux extensions. |
 | `scroll.detect_area_width` | `0` | 0..10 | `0` = require finger near the edge; `10` = whole pad. |
 | `scroll.horizontal_start` | `2` | 0..15 | π/8 units. Default 45° → 135° = the bottom edge of the pad. |
 | `scroll.horizontal_end` | `6` | 0..15 | |
@@ -89,7 +89,11 @@ level = "info"  # trace | debug | info | warn | error
 journalctl --user -u letsnote-wheelpad -f
 ```
 
-If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the config (-2..+2). The daemon does not auto-calibrate — history capacity is fixed at 20 slots to match Windows exactly (see DECISIONS.md D-021-followup).
+If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the config (-4..+2). The daemon does not auto-calibrate — history capacity is fixed at 20 slots to match Windows exactly (see DECISIONS.md D-021-followup).
+
+### High-resolution scrolling
+
+After circular intent is captured, every accepted curvature update produces a fractional `REL_WHEEL_HI_RES` or `REL_HWHEEL_HI_RES` v120 delta; 120 units represent one wheel detent. Sub-unit rounding residue is retained, and the movement dead band is 8 device units so a paused gesture responds promptly when it resumes. The detector separately emits legacy `REL_WHEEL`/`REL_HWHEEL` whole notches at the original accumulator crossings for older applications. Conforming consumers select the high-resolution or legacy stream rather than adding them together. This makes active scrolling smoother but does not add coasting: a stationary finger still produces no events. The initial 7.5° intent-classification delay remains necessary to distinguish circular scrolling from pointer input.
 
 ## Known issues / non-goals
 
@@ -111,7 +115,7 @@ In short: multi-finger input wins before circular capture; an already captured c
 
 ## How it works (one-paragraph version)
 
-The daemon takes exclusive ownership of the physical touchpad at startup (`EVIOCGRAB`, held forever) and creates two virtual `uinput` devices that libinput attaches to instead: a touchpad mirror (same capabilities as the physical pad) and a wheel. A 7-state FSM (`Idle`, `Contact`, `Moving`, `MultiTouch`, `Passthrough`, `Scrolling`, `Debounce`) arbitrates input. Ordinary events are forwarded verbatim; an outer-ring single-finger candidate is the exception, with complete frames held while `Moving` classifies its early trajectory. A pointer or multi-finger decision replays those frames in order, while a circular decision discards them and suppresses the rest of that physical contact stream. The circular detector is preheated with the candidate samples, then integrates chord-direction angles and emits one virtual-wheel notch at each ±π crossing. Since a captured touch never reaches the virtual touchpad at all, it produces neither an initial cursor jump nor stale libinput contact state at all-up.
+The daemon takes exclusive ownership of the physical touchpad at startup (`EVIOCGRAB`, held forever) and creates two virtual `uinput` devices that libinput attaches to instead: a touchpad mirror (same capabilities as the physical pad) and a wheel. A 7-state FSM (`Idle`, `Contact`, `Moving`, `MultiTouch`, `Passthrough`, `Scrolling`, `Debounce`) arbitrates input. Ordinary events are forwarded verbatim; an outer-ring single-finger candidate is the exception, with complete frames held while `Moving` classifies its early trajectory. A pointer or multi-finger decision replays those frames in order, while a circular decision discards them and suppresses the rest of that physical contact stream. The circular detector is preheated with the candidate samples, then integrates chord-direction angles into fractional v120 high-resolution movement while retaining legacy whole-notch output for compatibility. Since a captured touch never reaches the virtual touchpad at all, it produces neither an initial cursor jump nor stale libinput contact state at all-up.
 
 For the full algorithm details and the architectural pivot history — see `DECISIONS.md` (D-022 is the passthrough decision; D-008..D-021 are the algorithm choices) and the analysis docs alongside the source.
 

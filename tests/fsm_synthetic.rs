@@ -351,7 +351,7 @@ fn stationary_frames_after_scrolling_do_not_emit_more_ticks() {
     let scroll = default_scroll();
 
     // Ten-degree steps at r=220 are farther apart than the detector's
-    // 20-unit sample deadband. The first 20 degrees engage Scrolling;
+    // 8-unit sample deadband. The first 20 degrees engage Scrolling;
     // the remaining arc fills the curvature history and emits ticks.
     let moving_frames: Vec<_> = (0..=18)
         .map(|i| {
@@ -380,6 +380,39 @@ fn stationary_frames_after_scrolling_do_not_emit_more_ticks() {
         "stationary frames unexpectedly emitted {stationary_actions:?}"
     );
     assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+}
+
+#[test]
+fn reverse_vertical_flips_high_resolution_and_legacy_streams() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let mut scroll = default_scroll();
+    scroll.reverse_vertical = true;
+
+    let frames: Vec<_> = (0..=18)
+        .map(|i| {
+            let theta = i as f64 * PI / 18.0;
+            touch(
+                500 + (220.0 * theta.cos()).round() as i32,
+                500 + (220.0 * theta.sin()).round() as i32,
+            )
+        })
+        .collect();
+    let actions = drive(&mut fsm, &mut det, &scroll, &frames);
+    let mut v120 = 0;
+    let mut discrete = 0;
+    for action in actions {
+        if let Action::EmitWheelV(delta) = action {
+            v120 += delta.v120;
+            discrete += delta.discrete;
+        }
+    }
+
+    assert!(v120 > 0, "reversed clockwise v120 should be positive");
+    assert!(
+        discrete > 0,
+        "reversed clockwise legacy ticks should be positive"
+    );
 }
 
 #[test]

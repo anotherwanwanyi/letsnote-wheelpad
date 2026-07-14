@@ -3,7 +3,8 @@
 // We expose TWO virtual devices:
 //
 // 1. UinputWheel — virtual mouse wheel that carries REL_WHEEL{,_HI_RES}
-//    and REL_HWHEEL{,_HI_RES}. This is where the scroll ticks come out.
+//    and REL_HWHEEL{,_HI_RES}. This is where smooth v120 deltas and their
+//    legacy whole-notch approximations come out.
 //
 // 2. UinputTouchpad — virtual touchpad that mirrors the physical pad's
 //    capabilities. We grab the physical pad permanently at startup and
@@ -22,6 +23,7 @@ use evdev::{
 };
 use tracing::warn;
 
+use crate::detector::WheelDelta;
 use crate::error::{Error, Result};
 
 // --- Wheel device --------------------------------------------------------
@@ -30,10 +32,6 @@ const WHEEL_NAME: &str = "Let's Note WheelPad (virtual wheel)";
 const VENDOR_ID: u16 = 0x6c6e; // ASCII "ln"
 const WHEEL_PRODUCT_ID: u16 = 0x7770; // ASCII "wp"
 const VERSION: u16 = 1;
-
-/// One wheel "tick" = 120 hi-res units; same value real mice emit. Keeps
-/// libinput's smooth-scroll math happy on Wayland and X11 alike.
-const HI_RES_STEP: i32 = 120;
 
 pub struct UinputWheel {
     dev: VirtualDevice,
@@ -68,22 +66,21 @@ impl UinputWheel {
         Ok(Self { dev })
     }
 
-    /// Emit `ticks` vertical wheel notches. Positive = scroll up
-    /// (libinput convention). The caller already applied
-    /// `reverse_vertical` flipping; this function does not interpret
-    /// signs further.
-    pub fn emit_v(&mut self, ticks: i32) -> Result<()> {
+    /// Emit vertical high-resolution movement plus its legacy whole-notch
+    /// approximation. Positive values scroll up (libinput convention).
+    pub fn emit_v(&mut self, delta: WheelDelta) -> Result<()> {
         self.emit_axis(
-            ticks,
+            delta,
             RelativeAxisType::REL_WHEEL,
             RelativeAxisType::REL_WHEEL_HI_RES,
         )
     }
 
-    /// Emit `ticks` horizontal wheel notches. Positive = scroll right.
-    pub fn emit_h(&mut self, ticks: i32) -> Result<()> {
+    /// Emit horizontal high-resolution movement plus its legacy whole-notch
+    /// approximation. Positive values scroll right.
+    pub fn emit_h(&mut self, delta: WheelDelta) -> Result<()> {
         self.emit_axis(
-            ticks,
+            delta,
             RelativeAxisType::REL_HWHEEL,
             RelativeAxisType::REL_HWHEEL_HI_RES,
         )
@@ -91,21 +88,37 @@ impl UinputWheel {
 
     fn emit_axis(
         &mut self,
-        ticks: i32,
+        delta: WheelDelta,
         axis: RelativeAxisType,
         axis_hi_res: RelativeAxisType,
     ) -> Result<()> {
-        if ticks == 0 {
+        let events = prepare_wheel_events(delta, axis, axis_hi_res);
+        if events.is_empty() {
             return Ok(());
         }
-        let events = [
-            InputEvent::new(EventType::RELATIVE, axis_hi_res.0, ticks * HI_RES_STEP),
-            InputEvent::new(EventType::RELATIVE, axis.0, ticks),
-        ];
         self.dev
             .emit(&events)
             .map_err(|source| Error::UinputWrite { source })
     }
+}
+
+fn prepare_wheel_events(
+    delta: WheelDelta,
+    axis: RelativeAxisType,
+    axis_hi_res: RelativeAxisType,
+) -> Vec<InputEvent> {
+    let mut events = Vec::with_capacity(2);
+    if delta.v120 != 0 {
+        events.push(InputEvent::new(
+            EventType::RELATIVE,
+            axis_hi_res.0,
+            delta.v120,
+        ));
+    }
+    if delta.discrete != 0 {
+        events.push(InputEvent::new(EventType::RELATIVE, axis.0, delta.discrete));
+    }
+    events
 }
 
 // --- Touchpad passthrough device -----------------------------------------
@@ -255,5 +268,44 @@ impl UinputTouchpad {
         self.dev
             .emit(&filtered)
             .map_err(|source| Error::UinputWrite { source })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fractional_wheel_update_emits_only_high_resolution_axis() {
+        let events = prepare_wheel_events(
+            WheelDelta {
+                v120: 30,
+                discrete: 0,
+            },
+            RelativeAxisType::REL_WHEEL,
+            RelativeAxisType::REL_WHEEL_HI_RES,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), RelativeAxisType::REL_WHEEL_HI_RES.0);
+        assert_eq!(events[0].value(), 30);
+    }
+
+    #[test]
+    fn whole_notch_update_emits_high_resolution_and_legacy_axes() {
+        let events = prepare_wheel_events(
+            WheelDelta {
+                v120: 40,
+                discrete: 1,
+            },
+            RelativeAxisType::REL_WHEEL,
+            RelativeAxisType::REL_WHEEL_HI_RES,
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].code(), RelativeAxisType::REL_WHEEL_HI_RES.0);
+        assert_eq!(events[0].value(), 40);
+        assert_eq!(events[1].code(), RelativeAxisType::REL_WHEEL.0);
+        assert_eq!(events[1].value(), 1);
     }
 }

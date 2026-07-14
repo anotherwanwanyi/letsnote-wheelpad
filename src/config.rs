@@ -48,7 +48,8 @@ impl Default for Scroll {
     fn default() -> Self {
         // Defaults verbatim from WheelPad.exe — see RE-findings.md §3 and
         // DECISIONS.md D-008..D-010. Sensitivity index 0 selects the
-        // middle entry (multiplier 20) of [10, 14, 20, 28, 40].
+        // multiplier 20 of [5, 7, 10, 14, 20, 28, 40]. The two lowest
+        // entries are Linux extensions for smoother slow scrolling.
         Self {
             enable: true,
             reverse_vertical: false,
@@ -95,11 +96,11 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         let s = &self.scroll;
-        if !(-2..=2).contains(&s.sensitivity) {
+        if !(-4..=2).contains(&s.sensitivity) {
             return Err(Error::ConfigRange {
                 key: "scroll.sensitivity",
                 value: s.sensitivity as i64,
-                expected: "-2..=2",
+                expected: "-4..=2",
             });
         }
         if !(0..=10).contains(&s.detect_area_width) {
@@ -177,7 +178,18 @@ mod tests {
     #[test]
     fn validate_rejects_out_of_range_sensitivity() {
         let mut c = Config::default();
-        c.scroll.sensitivity = 5;
+        c.scroll.sensitivity = -5;
         assert!(c.validate().is_err());
+        c.scroll.sensitivity = 3;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_extended_low_sensitivity() {
+        let mut c = Config::default();
+        c.scroll.sensitivity = -4;
+        assert!(c.validate().is_ok());
+        c.scroll.sensitivity = -3;
+        assert!(c.validate().is_ok());
     }
 }
