@@ -116,6 +116,30 @@ impl CircularDetector {
         true
     }
 
+    /// Push a sample for direct polar angle integration ([`Self::step_polar`]).
+    ///
+    /// Unlike [`Self::push_if_moved`] (which enforces an 8-unit deadband to
+    /// avoid diluting the legacy 20-sample chord-curvature window), polar
+    /// angle integration is an exact telescoping sum and does not suffer from
+    /// window dilution. Filtering only stationary / 1-unit jitter (`dx² + dy² <= 1`)
+    /// lets high-resolution wheel updates stream at the touchpad's native
+    /// ~125Hz report rate instead of lumping frames into 20–30Hz steps.
+    pub fn push_polar_sample(&mut self, s: TouchSample) -> bool {
+        if let Some(prev) = self.last_stored {
+            let dx = (s.x - prev.x) as i64;
+            let dy = (s.y - prev.y) as i64;
+            if dx * dx + dy * dy <= 1 {
+                return false;
+            }
+        }
+        self.last_stored = Some(s);
+        if self.history.len() == HISTORY_CAPACITY {
+            self.history.pop_back();
+        }
+        self.history.push_front(s);
+        true
+    }
+
     /// Integrate one stored sample into both high-resolution v120 movement
     /// and the legacy whole-detent approximation. Positive curvature maps
     /// to negative wheel movement, preserving the Windows sign convention.
@@ -193,16 +217,62 @@ impl CircularDetector {
         //    note remains so future readers don't think the quirk was
         //    overlooked.
         let mut ticks: i32 = 0;
-        if valid >= 3 {
-            self.accumulator += curvature_delta;
-            while self.accumulator > PI {
-                self.accumulator -= PI2;
-                ticks -= 1;
-            }
-            while self.accumulator < -PI {
-                self.accumulator += PI2;
-                ticks += 1;
-            }
+        self.accumulator += curvature_delta;
+        while self.accumulator > PI {
+            self.accumulator -= PI2;
+            ticks -= 1;
+        }
+        while self.accumulator < -PI {
+            self.accumulator += PI2;
+            ticks += 1;
+        }
+        WheelDelta {
+            v120,
+            discrete: ticks,
+        }
+    }
+
+    /// Direct center-relative polar angle integration ($\Delta\theta$).
+    ///
+    /// Unlike the legacy chord-curvature moving average (`step`), this
+    /// integrates the exact angular displacement around `(center_x, center_y)`
+    /// between the previous and current stored samples:
+    /// - No 3.5x startup amplification while a 20-sample window fills.
+    /// - No "ghost momentum" when decelerating from a fast sweep to slow
+    ///   micro-adjustments, and no history dilution on quick flicks.
+    /// - Orthogonal to radial finger wobble.
+    pub fn step_polar(
+        &mut self,
+        center_x: i32,
+        center_y: i32,
+        scroll_speed_adjust: i32,
+    ) -> WheelDelta {
+        if self.history.len() < 2 {
+            return WheelDelta::default();
+        }
+        let current = self.history[0];
+        let prev = self.history[1];
+        let d_theta = engagement_swept_angle(center_x, center_y, prev, current);
+        if d_theta.abs() > NOISE_REJECT_ANGLE {
+            return WheelDelta::default();
+        }
+
+        let idx = (scroll_speed_adjust.clamp(-4, 2) + 4) as usize;
+        let sensitivity = SENSITIVITY_TABLE[idx] as f64;
+        let curvature_delta = sensitivity * d_theta;
+        let exact_v120 = self.v120_remainder - curvature_delta * (120.0 / PI2);
+        let v120 = exact_v120.round() as i32;
+        self.v120_remainder = exact_v120 - v120 as f64;
+
+        let mut ticks: i32 = 0;
+        self.accumulator += curvature_delta;
+        while self.accumulator > PI {
+            self.accumulator -= PI2;
+            ticks -= 1;
+        }
+        while self.accumulator < -PI {
+            self.accumulator += PI2;
+            ticks += 1;
         }
         WheelDelta {
             v120,
@@ -249,11 +319,35 @@ pub fn radial_gate_ok(
     s: TouchSample,
     detect_area_width: i32,
 ) -> bool {
+    radial_gate_ok_with_radius(center_x, center_y, None, s, detect_area_width)
+}
+
+/// Radial gate that scales the outer-ring threshold to the touchpad's
+/// physical radius when known (`pad_radius = Some(r)`), or falls back to
+/// the fixed 200-unit formula when `None`.
+///
+/// With a known hardware radius `r`, `detect_area_width = 0` reserves the
+/// inner 68% of the radius (`r_min = 0.68 * r`) for zero-latency pointer
+/// and multi-touch input, leaving the outer 32% bezel ring for circular
+/// scrolling. Raising `detect_area_width` toward 10 linearly shrinks the
+/// inner dead zone down to 0 (whole pad active).
+pub fn radial_gate_ok_with_radius(
+    center_x: i32,
+    center_y: i32,
+    pad_radius: Option<i32>,
+    s: TouchSample,
+    detect_area_width: i32,
+) -> bool {
     let dx = (s.x - center_x) as i64;
     let dy = (s.y - center_y) as i64;
     let r2 = dx * dx + dy * dy;
     let w = (10 - detect_area_width.clamp(0, 10)) as i64;
-    r2 >= (w * w) * 400
+    if let Some(radius) = pad_radius {
+        let min_r = (radius.max(1) as f64) * 0.68 * (w as f64 / 10.0);
+        r2 >= (min_r * min_r).round() as i64
+    } else {
+        r2 >= (w * w) * 400
+    }
 }
 
 /// Horizontal-arc test (FUN_140005a00 lines 65-74). Returns true if the

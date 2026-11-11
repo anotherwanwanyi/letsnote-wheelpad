@@ -4,7 +4,7 @@ use std::f64::consts::PI;
 
 use letsnote_wheelpad::config::Scroll;
 use letsnote_wheelpad::detector::{CircularDetector, TouchSample};
-use letsnote_wheelpad::fsm::{Action, Fsm, FsmState, TouchFrame, TrackedTouch};
+use letsnote_wheelpad::fsm::{Action, Fsm, FsmState, ScrollAxis, TouchFrame, TrackedTouch};
 
 const PRIMARY_TRACKING_ID: i32 = 100;
 
@@ -59,7 +59,7 @@ fn idle_to_contact_on_touchdown_inside_dead_zone() {
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
     let _ = drive(&mut fsm, &mut det, &scroll, &[touch(510, 510)]);
-    assert!(matches!(fsm.state(), FsmState::Contact { .. }));
+    assert_eq!(fsm.state(), FsmState::Contact);
 }
 
 #[test]
@@ -95,8 +95,9 @@ fn contact_does_not_engage_on_cross_gate_movement() {
         &scroll,
         &[touch(510, 510), touch(550, 500), touch(720, 500)],
     );
-    assert!(
-        matches!(fsm.state(), FsmState::Contact { .. }),
+    assert_eq!(
+        fsm.state(),
+        FsmState::Contact,
         "expected to stay in Contact, got {:?}",
         fsm.state()
     );
@@ -321,7 +322,7 @@ fn runtime_can_cancel_a_stalled_pending_candidate() {
 }
 
 #[test]
-fn scrolling_to_debounce_on_lift() {
+fn scrolling_to_idle_on_lift() {
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
@@ -341,7 +342,7 @@ fn scrolling_to_debounce_on_lift() {
     assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
 
     drive(&mut fsm, &mut det, &scroll, &[lift()]);
-    assert!(matches!(fsm.state(), FsmState::Debounce));
+    assert_eq!(fsm.state(), FsmState::Idle);
 }
 
 #[test]
@@ -477,7 +478,8 @@ fn captured_scroll_stays_locked_to_original_tracking_id() {
     const ADDED_ID: i32 = 202;
 
     // Deliberately start in slot 1, then add a lower-numbered slot after
-    // capture. The recognizer must follow the tracking ID, not slot order.
+    // capture has locked in. The recognizer must follow the tracking ID,
+    // not slot order.
     let start = touch_frame(&[(1, CAPTURED_ID, 720, 500)]);
     let early_theta = PI / 16.0;
     let early = touch_frame(&[(
@@ -494,17 +496,41 @@ fn captured_scroll_stays_locked_to_original_tracking_id() {
         500 + (220.0 * theta.sin()).round() as i32,
     )]);
     drive(&mut fsm, &mut det, &scroll, &[start, early, engage]);
-    assert!(matches!(
+    assert_eq!(
         fsm.state(),
         FsmState::Scrolling {
             tracking_id: CAPTURED_ID,
-            slot: 1
+            axis: ScrollAxis::Vertical,
+            locked: false,
         }
-    ));
+    );
+
+    // Advance past the 4-frame early preemption window as a single finger
+    // so circular scrolling locks in.
+    let lock_in: Vec<_> = (3..=6)
+        .map(|i| {
+            let theta = i as f64 * PI / 18.0;
+            touch_frame(&[(
+                1,
+                CAPTURED_ID,
+                500 + (220.0 * theta.cos()).round() as i32,
+                500 + (220.0 * theta.sin()).round() as i32,
+            )])
+        })
+        .collect();
+    drive(&mut fsm, &mut det, &scroll, &lock_in);
+    assert_eq!(
+        fsm.state(),
+        FsmState::Scrolling {
+            tracking_id: CAPTURED_ID,
+            axis: ScrollAxis::Vertical,
+            locked: true,
+        }
+    );
 
     // Keep moving the captured finger around the rim while a new finger
     // occupies slot 0. Circular scrolling remains active and emits ticks.
-    let with_added_finger: Vec<_> = (3..=18)
+    let with_added_finger: Vec<_> = (7..=18)
         .map(|i| {
             let theta = i as f64 * PI / 18.0;
             touch_frame(&[
@@ -539,16 +565,17 @@ fn captured_scroll_stays_locked_to_original_tracking_id() {
         .collect();
     let actions = drive(&mut fsm, &mut det, &scroll, &replacement_motion);
     assert!(actions.is_empty());
-    assert!(matches!(
+    assert_eq!(
         fsm.state(),
         FsmState::Scrolling {
             tracking_id: CAPTURED_ID,
-            slot: 1
+            axis: ScrollAxis::Vertical,
+            locked: true,
         }
-    ));
+    );
 
     drive(&mut fsm, &mut det, &scroll, &[lift()]);
-    assert!(matches!(fsm.state(), FsmState::Debounce));
+    assert_eq!(fsm.state(), FsmState::Idle);
 }
 
 #[test]
@@ -578,9 +605,12 @@ fn force_idle_resets_state() {
 }
 
 #[test]
-fn debounce_to_idle_on_next_frame_no_timer() {
-    // Debounce always exits to Idle on the next frame regardless of
-    // whether the finger is now down or up.
+fn consecutive_circular_gesture_holds_new_touchdown_frame() {
+    // Regression test: after a circular gesture lifts, the very next frame
+    // from evdev is the first touch-down of the subsequent gesture. It must
+    // immediately enter `Moving` (so the runtime holds the touch-down frame)
+    // rather than being consumed by a dummy Debounce -> Idle transition that
+    // forwards BTN_TOUCH=1 to the virtual touchpad.
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
@@ -592,42 +622,63 @@ fn debounce_to_idle_on_next_frame_no_timer() {
         500 + (220.0 * early_theta.sin()).round() as i32,
     );
     let theta = PI / 8.0;
-    let mid_x = 500 + (220.0 * theta.cos()).round() as i32;
-    let mid_y = 500 + (220.0 * theta.sin()).round() as i32;
-    let mid = touch(mid_x, mid_y);
+    let mid = touch(
+        500 + (220.0 * theta.cos()).round() as i32,
+        500 + (220.0 * theta.sin()).round() as i32,
+    );
 
-    drive(&mut fsm, &mut det, &scroll, &[start, early, mid, lift()]);
-    assert!(matches!(fsm.state(), FsmState::Debounce));
+    drive(&mut fsm, &mut det, &scroll, &[start.clone(), early.clone(), mid.clone(), lift()]);
+    assert_eq!(fsm.state(), FsmState::Idle);
 
-    drive(&mut fsm, &mut det, &scroll, &[lift()]);
-    assert!(matches!(fsm.state(), FsmState::Idle));
+    // First frame of the second gesture: must immediately enter Moving.
+    drive(&mut fsm, &mut det, &scroll, &[start]);
+    assert!(matches!(fsm.state(), FsmState::Moving { .. }));
+
+    // Completing the second gesture's initial curve captures Scrolling again.
+    drive(&mut fsm, &mut det, &scroll, &[early, mid]);
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
 }
 
 #[test]
-fn debounce_to_idle_even_if_finger_back_down() {
-    // The Debounce state has no re-engagement path. If a finger is down
-    // on the very next frame, we still go to Idle this frame; the frame
-    // *after* that re-runs the fresh-touch classifier.
+fn nearly_straight_tangent_with_quantization_jitter_does_not_capture_scroll() {
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
 
-    let start = touch(720, 500);
-    let early_theta = PI / 16.0;
-    let early = touch(
-        500 + (220.0 * early_theta.cos()).round() as i32,
-        500 + (220.0 * early_theta.sin()).round() as i32,
+    // A straight tangential stroke with 1-unit integer quantization step
+    // (~2.86° local turn) must not be falsely captured as circular scroll.
+    drive(
+        &mut fsm,
+        &mut det,
+        &scroll,
+        &[
+            touch(720, 500),
+            touch(720, 520),
+            touch(719, 540),
+            touch(719, 560),
+            touch(719, 580),
+        ],
     );
-    let theta = PI / 8.0;
-    let mid_x = 500 + (220.0 * theta.cos()).round() as i32;
-    let mid_y = 500 + (220.0 * theta.sin()).round() as i32;
-    let mid = touch(mid_x, mid_y);
+    assert_eq!(fsm.state(), FsmState::Passthrough);
+}
 
-    drive(&mut fsm, &mut det, &scroll, &[start, early, mid, lift()]);
-    assert!(matches!(fsm.state(), FsmState::Debounce));
+#[test]
+fn light_touch_before_btn_touch_is_still_held_in_moving() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
 
-    drive(&mut fsm, &mut det, &scroll, &[touch(720, 500)]);
-    assert!(matches!(fsm.state(), FsmState::Idle));
+    // Frame 1 reports a valid MT slot tracking ID before BTN_TOUCH flips true.
+    let light_frame = TouchFrame {
+        contact: false,
+        touches: vec![TrackedTouch {
+            slot: 0,
+            tracking_id: PRIMARY_TRACKING_ID,
+            pos: TouchSample { x: 720, y: 500 },
+        }],
+    };
+    drive(&mut fsm, &mut det, &scroll, &[light_frame]);
+    assert!(matches!(fsm.state(), FsmState::Moving { .. }));
 }
 
 #[test]
@@ -645,4 +696,144 @@ fn disabled_scroll_holds_idle() {
         &[touch(720, 500), touch(700, 520), lift()],
     );
     assert!(matches!(fsm.state(), FsmState::Idle));
+}
+
+#[test]
+fn second_finger_during_early_scroll_window_preempts_to_multitouch() {
+    // When a user performs a fast 2/3-finger gesture, Finger 1 can land
+    // 20-35ms before Finger 2 and briefly cross the 3-sample circular
+    // threshold. A second finger arriving during the 4-frame early
+    // preemption window (`locked == false`) must preempt `Scrolling`
+    // into `MultiTouch`.
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    let start = touch(720, 500);
+    let early_theta = PI / 16.0;
+    let early = touch(
+        500 + (220.0 * early_theta.cos()).round() as i32,
+        500 + (220.0 * early_theta.sin()).round() as i32,
+    );
+    let theta = PI / 8.0;
+    let engage = touch(
+        500 + (220.0 * theta.cos()).round() as i32,
+        500 + (220.0 * theta.sin()).round() as i32,
+    );
+    drive(&mut fsm, &mut det, &scroll, &[start, early, engage]);
+    assert!(matches!(
+        fsm.state(),
+        FsmState::Scrolling { locked: false, .. }
+    ));
+
+    let second_finger = touch_frame(&[(0, PRIMARY_TRACKING_ID, 680, 580), (1, 202, 560, 560)]);
+    let actions = drive(&mut fsm, &mut det, &scroll, &[second_finger]);
+    assert!(actions.is_empty());
+    assert_eq!(fsm.state(), FsmState::MultiTouch);
+}
+
+#[test]
+fn adaptive_radius_shrinks_outer_ring_proportionally_to_pad_radius() {
+    // On CF-FV1 (center = 385, radius = 385), detect_area_width = 0 sets
+    // the dead-zone gate to 0.68 * 385 = 261.8 units (~54% outer-ring area
+    // instead of 73% under the old hardcoded 200). A touch at r = 230 is
+    // trapped in Contact, while a touch at r = 300 enters Moving.
+    let mut fsm = Fsm::with_radius(385, 385, 385);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    drive(&mut fsm, &mut det, &scroll, &[touch(385 + 230, 385)]);
+    assert_eq!(fsm.state(), FsmState::Contact);
+
+    drive(&mut fsm, &mut det, &scroll, &[lift(), touch(385 + 300, 385)]);
+    assert!(matches!(fsm.state(), FsmState::Moving { .. }));
+}
+
+#[test]
+fn horizontal_scroll_locks_axis_at_capture_and_does_not_flip_mid_circle() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let mut scroll = default_scroll();
+    scroll.horizontal_enable = true;
+
+    // 1. Start at angle 0 (east, outside the 45°..135° horizontal sector)
+    //    and sweep a full circle through the bottom sector (90°). Every
+    //    emitted tick must stay Vertical.
+    let vertical_circle: Vec<_> = (0..=36)
+        .map(|i| {
+            let theta = i as f64 * PI / 18.0;
+            touch(
+                500 + (220.0 * theta.cos()).round() as i32,
+                500 + (220.0 * theta.sin()).round() as i32,
+            )
+        })
+        .collect();
+    let v_actions = drive(&mut fsm, &mut det, &scroll, &vertical_circle);
+    assert!(!v_actions.is_empty());
+    assert!(
+        v_actions.iter().all(|a| matches!(a, Action::EmitWheelV(_))),
+        "vertical gesture flipped to horizontal mid-circle: {v_actions:?}"
+    );
+
+    drive(&mut fsm, &mut det, &scroll, &[lift()]);
+
+    // 2. Start at angle 90° (south, inside the 45°..135° horizontal sector)
+    //    and sweep past 135°. Every emitted tick must stay Horizontal.
+    let horizontal_circle: Vec<_> = (9..=27)
+        .map(|i| {
+            let theta = i as f64 * PI / 18.0;
+            touch(
+                500 + (220.0 * theta.cos()).round() as i32,
+                500 + (220.0 * theta.sin()).round() as i32,
+            )
+        })
+        .collect();
+    let h_actions = drive(&mut fsm, &mut det, &scroll, &horizontal_circle);
+    assert!(!h_actions.is_empty());
+    assert!(
+        h_actions.iter().all(|a| matches!(a, Action::EmitWheelH(_))),
+        "horizontal gesture flipped to vertical mid-circle: {h_actions:?}"
+    );
+}
+
+#[test]
+fn fine_per_frame_movements_emit_high_frequency_v120_updates() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+
+    // Engage Scrolling first.
+    let start = touch(720, 500);
+    let early_theta = PI / 16.0;
+    let early = touch(
+        500 + (220.0 * early_theta.cos()).round() as i32,
+        500 + (220.0 * early_theta.sin()).round() as i32,
+    );
+    let engage_theta = PI / 8.0;
+    let engage = touch(
+        500 + (220.0 * engage_theta.cos()).round() as i32,
+        500 + (220.0 * engage_theta.sin()).round() as i32,
+    );
+    drive(&mut fsm, &mut det, &scroll, &[start, early, engage]);
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+
+    // Now advance in tiny 0.5° (~1.9 device unit) steps per frame.
+    // Under the old 8-unit deadband, these frames were held back for
+    // 5 frames at a time; with `push_polar_sample`, nearly every frame
+    // emits a smooth 1-2 unit v120 update.
+    let fine_frames: Vec<_> = (1..=6)
+        .map(|i| {
+            let theta = engage_theta + (i as f64) * (0.5 * PI / 180.0);
+            touch(
+                500 + (220.0 * theta.cos()).round() as i32,
+                500 + (220.0 * theta.sin()).round() as i32,
+            )
+        })
+        .collect();
+    let actions = drive(&mut fsm, &mut det, &scroll, &fine_frames);
+    assert!(
+        actions.len() >= 5,
+        "expected per-frame high-res updates on fine 2-unit steps, got only {}: {actions:?}",
+        actions.len()
+    );
 }

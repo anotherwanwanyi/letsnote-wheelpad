@@ -5,22 +5,25 @@ use std::f64::consts::PI;
 
 use crate::config::Scroll;
 use crate::detector::{
-    engagement_swept_angle, radial_gate_ok, within_horizontal_arc, CircularDetector, TouchSample,
-    WheelDelta, TRIGGER_ANGLE,
+    engagement_swept_angle, radial_gate_ok_with_radius, within_horizontal_arc, CircularDetector,
+    TouchSample, WheelDelta, TRIGGER_ANGLE,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollAxis {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsmState {
     Idle,
-    Contact {
-        origin: TouchSample,
-    },
+    Contact,
     Moving {
         tracking_id: i32,
-        slot: usize,
     },
     /// Two or more contacts were observed before circular scrolling was
-    /// captured. Keep forwarding the physical stream to libinput and do
+    /// locked in. Keep forwarding the physical stream to libinput and do
     /// not reconsider circular scrolling until every finger has lifted.
     MultiTouch,
     /// The pending outer-ring contact was classified as ordinary pointer
@@ -28,22 +31,13 @@ pub enum FsmState {
     Passthrough,
     Scrolling {
         tracking_id: i32,
-        slot: usize,
+        axis: ScrollAxis,
+        /// `false` during the brief early-preemption window right after
+        /// capture so a slightly delayed second finger can still preempt
+        /// into `MultiTouch`; `true` once single-finger scrolling is
+        /// established.
+        locked: bool,
     },
-    // The FSM has an explicit Debounce state to preserve the structure
-    // of the original Windows WheelPad FSM (FUN_1400046a0 case 5).
-    //
-    // The Windows timer expression decompiled to `abs(int) < 1`, which
-    // is literally "true only on the same millisecond as the lift" —
-    // almost certainly a Ghidra-reconstruction artifact for a bound
-    // check that was originally `< CONST_TIMEOUT_MS`.
-    //
-    // Since the literal expression makes the timer-still-active branch
-    // effectively unreachable on Windows, real Windows users do not
-    // experience debounce-based quick relift. We mirror that: enter
-    // Debounce on lift and exit to Idle on the very next frame, with no
-    // timer check. We deliberately do NOT expose a TOML knob for this.
-    Debounce,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,17 +68,22 @@ pub struct Fsm {
     state: FsmState,
     center_x: i32,
     center_y: i32,
+    pad_radius: Option<i32>,
     intent_samples: Vec<TouchSample>,
+    early_scroll_frames: usize,
 }
 
 const INTENT_SAMPLE_DEADBAND_SQ: i64 = 64; // 8 device units
 const INTENT_MIN_SAMPLES: usize = 3;
 const INTENT_MAX_SAMPLES: usize = 20;
-const INTENT_MIN_TURN: f64 = PI / 180.0; // 1° of net chord-direction curvature
-const INTENT_TANGENTIAL_RATIO: f64 = 1.0;
+const INTENT_MIN_TURN: f64 = 3.5 * PI / 180.0; // 3.5° of net chord-direction curvature
+const INTENT_TANGENTIAL_RATIO: f64 = 1.5;
 const POINTER_RADIAL_RATIO: f64 = 1.5;
 const POINTER_MIN_RADIAL_TRAVEL: f64 = 40.0;
-const POINTER_STRAIGHT_SWEEP: f64 = PI / 10.0; // 18°
+const POINTER_STRAIGHT_SWEEP: f64 = PI / 12.0; // 15°
+/// Number of single-finger frames after initial `Scrolling` capture during
+/// which a newly arriving second finger can still preempt into `MultiTouch`.
+const EARLY_SCROLL_PREEMPT_FRAMES: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IntentDecision {
@@ -99,7 +98,20 @@ impl Fsm {
             state: FsmState::Idle,
             center_x,
             center_y,
+            pad_radius: None,
             intent_samples: Vec::with_capacity(INTENT_MAX_SAMPLES),
+            early_scroll_frames: 0,
+        }
+    }
+
+    pub fn with_radius(center_x: i32, center_y: i32, radius: i32) -> Self {
+        Self {
+            state: FsmState::Idle,
+            center_x,
+            center_y,
+            pad_radius: Some(radius.max(1)),
+            intent_samples: Vec::with_capacity(INTENT_MAX_SAMPLES),
+            early_scroll_frames: 0,
         }
     }
 
@@ -131,10 +143,11 @@ impl Fsm {
         if !scroll.enable {
             self.state = FsmState::Idle;
             self.intent_samples.clear();
+            self.early_scroll_frames = 0;
             return Action::None;
         }
 
-        let has_contact = frame.contact && !frame.touches.is_empty();
+        let has_contact = frame.contact || !frame.touches.is_empty();
 
         match self.state {
             // ---------- Idle (state 1) ----------
@@ -143,36 +156,48 @@ impl Fsm {
                 self.state = FsmState::MultiTouch;
                 Action::None
             }
+            FsmState::Idle if frame.touches.is_empty() => {
+                // BTN_TOUCH asserted before any MT slot tracking ID arrived;
+                // treat as ordinary passthrough until all-up.
+                self.state = FsmState::Passthrough;
+                Action::None
+            }
             FsmState::Idle => {
                 let touch = frame.touches[0];
                 let s = touch.pos;
-                // Fresh touch-down: radial-gate classifier (FUN_140005a00).
-                if radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
+                // Fresh touch-down: radial-gate classifier (FUN_140005a00),
+                // scaled to the touchpad's actual radius when known.
+                if radial_gate_ok_with_radius(
+                    self.center_x,
+                    self.center_y,
+                    self.pad_radius,
+                    s,
+                    scroll.detect_area_width,
+                ) {
                     // Outside dead zone → pending circular intent. Raw
                     // frames are held by the runtime until this state is
                     // resolved as circular or ordinary pointer input.
                     self.state = FsmState::Moving {
                         tracking_id: touch.tracking_id,
-                        slot: touch.slot,
                     };
                     self.intent_samples.clear();
                     self.intent_samples.push(s);
                 } else {
                     // Inside dead zone → CONTACT (trap).
-                    self.state = FsmState::Contact { origin: s };
+                    self.state = FsmState::Contact;
                 }
                 Action::None
             }
 
             // ---------- Contact (state 2) — dead-zone trap ----------
-            FsmState::Contact { .. } if !has_contact => {
+            FsmState::Contact if !has_contact => {
                 // Finger lifted. Per FUN_1400046a0 case 2 lines 118-126,
                 // Contact only exits to Idle on lift; cross-gate movement
                 // while in Contact does NOT transition to Moving.
                 self.state = FsmState::Idle;
                 Action::None
             }
-            FsmState::Contact { .. } => {
+            FsmState::Contact => {
                 // Stay trapped regardless of where the finger is now.
                 Action::None
             }
@@ -192,7 +217,14 @@ impl Fsm {
                 self.intent_samples.clear();
                 Action::None
             }
-            FsmState::Moving { tracking_id, slot } => {
+            FsmState::Moving { .. } if frame.touches.is_empty() => {
+                // Slot released while BTN_TOUCH is still clearing; flush
+                // held frames as ordinary pointer input until all-up.
+                self.state = FsmState::Passthrough;
+                self.intent_samples.clear();
+                Action::None
+            }
+            FsmState::Moving { tracking_id } => {
                 let touch = frame.touches[0];
                 if touch.tracking_id != tracking_id {
                     // One finger was replaced by another without an
@@ -203,7 +235,13 @@ impl Fsm {
                     return Action::None;
                 }
                 let s = touch.pos;
-                if !radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
+                if !radial_gate_ok_with_radius(
+                    self.center_x,
+                    self.center_y,
+                    self.pad_radius,
+                    s,
+                    scroll.detect_area_width,
+                ) {
                     // Slipped back into the dead zone: this was ordinary
                     // pointer movement. Flush the held frames and lock in
                     // passthrough until all contacts lift.
@@ -219,19 +257,46 @@ impl Fsm {
                             Action::None
                         }
                         IntentDecision::Circular => {
+                            // Lock horizontal vs. vertical axis once at capture
+                            // based on where the gesture started, so continuous
+                            // full-circle scrolling doesn't flip between V and H
+                            // when passing through the bottom sector.
+                            let start_sample = self.intent_samples.first().copied().unwrap_or(s);
+                            let axis = if scroll.horizontal_enable
+                                && within_horizontal_arc(
+                                    self.center_x,
+                                    self.center_y,
+                                    start_sample,
+                                    scroll.horizontal_start,
+                                    scroll.horizontal_end,
+                                ) {
+                                ScrollAxis::Horizontal
+                            } else {
+                                ScrollAxis::Vertical
+                            };
+
                             // Seed the detector with every held candidate
                             // sample instead of throwing away the motion
                             // that established circular intent.
                             detector.on_gesture_start();
                             let mut delta = WheelDelta::default();
                             for sample in self.intent_samples.drain(..) {
-                                if detector.push_if_moved(sample) {
-                                    delta += detector.step(scroll.sensitivity);
+                                if detector.push_polar_sample(sample) {
+                                    delta += detector.step_polar(
+                                        self.center_x,
+                                        self.center_y,
+                                        scroll.sensitivity,
+                                    );
                                 }
                             }
-                            self.state = FsmState::Scrolling { tracking_id, slot };
+                            self.early_scroll_frames = 0;
+                            self.state = FsmState::Scrolling {
+                                tracking_id,
+                                axis,
+                                locked: false,
+                            };
                             if !delta.is_zero() {
-                                emit(delta, scroll, self.center_x, self.center_y, s)
+                                emit(delta, scroll, axis)
                             } else {
                                 Action::None
                             }
@@ -256,42 +321,62 @@ impl Fsm {
 
             // ---------- Scrolling (state 4) ----------
             FsmState::Scrolling { .. } if !has_contact => {
-                // Lift → Debounce. The runtime suppresses this final
-                // physical frame because the captured contact was never
-                // exposed to the virtual touchpad.
-                self.state = FsmState::Debounce;
+                // Lift → Idle directly. Returning straight to Idle on the
+                // all-up frame ensures the runtime suppresses this final
+                // lift frame (`previous_scrolling == true`) while the
+                // very next touch-down frame starts from `Idle` and is
+                // properly held for intent classification instead of
+                // leaking through a dummy Debounce transition.
+                self.state = FsmState::Idle;
+                self.early_scroll_frames = 0;
                 Action::None
             }
-            FsmState::Scrolling { tracking_id, .. } => {
-                // Circular scrolling owns the stream once captured, even
-                // if more fingers are added. Continue following only the
-                // original tracking ID; never jump to a different slot.
+            FsmState::Scrolling { locked: false, .. } if frame.touches.len() > 1 => {
+                // A second finger arrived during the brief early-preemption
+                // window right after circular capture (e.g. a fast 2/3-finger
+                // swipe where Finger 1 landed ~20ms before Finger 2). Preempt
+                // into MultiTouch so the runtime flushes the held initial
+                // frames to libinput as a complete multi-finger gesture.
+                self.state = FsmState::MultiTouch;
+                self.early_scroll_frames = 0;
+                detector.on_gesture_start();
+                Action::None
+            }
+            FsmState::Scrolling {
+                tracking_id,
+                axis,
+                locked,
+            } => {
+                self.early_scroll_frames = self.early_scroll_frames.saturating_add(1);
+                if !locked && self.early_scroll_frames >= EARLY_SCROLL_PREEMPT_FRAMES {
+                    self.state = FsmState::Scrolling {
+                        tracking_id,
+                        axis,
+                        locked: true,
+                    };
+                }
+
+                // Circular scrolling owns the stream once locked, even
+                // if more fingers are added later. Continue following only
+                // the original tracking ID; never jump to a different slot.
                 let tracked = frame
                     .touches
                     .iter()
                     .find(|touch| touch.tracking_id == tracking_id);
                 if let Some(touch) = tracked {
-                    if !detector.push_if_moved(touch.pos) {
+                    if !detector.push_polar_sample(touch.pos) {
                         return Action::None;
                     }
-                    let delta = detector.step(scroll.sensitivity);
+                    let delta =
+                        detector.step_polar(self.center_x, self.center_y, scroll.sensitivity);
                     if !delta.is_zero() {
-                        emit(delta, scroll, self.center_x, self.center_y, touch.pos)
+                        emit(delta, scroll, axis)
                     } else {
                         Action::None
                     }
                 } else {
                     Action::None
                 }
-            }
-
-            // ---------- Debounce (state 5) — structural marker only ----------
-            FsmState::Debounce => {
-                // Always transition to Idle on the next frame, regardless
-                // of whether the finger is now down or up. See the comment
-                // on FsmState::Debounce above.
-                self.state = FsmState::Idle;
-                Action::None
             }
         }
     }
@@ -305,6 +390,7 @@ impl Fsm {
     pub fn force_idle(&mut self, detector: &mut CircularDetector) {
         self.state = FsmState::Idle;
         self.intent_samples.clear();
+        self.early_scroll_frames = 0;
         detector.on_gesture_start();
     }
 
@@ -411,37 +497,25 @@ fn wrap_angle(mut angle: f64) -> f64 {
     angle
 }
 
-/// Apply reverse flags and the arc gate, then return the appropriate
-/// EmitWheelV / EmitWheelH action. The horizontal arc is only consulted
-/// when `horizontal_enable = true`; vertical scroll is never angle-gated.
-fn emit(
-    delta: WheelDelta,
-    scroll: &Scroll,
-    center_x: i32,
-    center_y: i32,
-    current: TouchSample,
-) -> Action {
-    if scroll.horizontal_enable
-        && within_horizontal_arc(
-            center_x,
-            center_y,
-            current,
-            scroll.horizontal_start,
-            scroll.horizontal_end,
-        )
-    {
-        let signed = if scroll.reverse_horizontal {
-            delta.reversed()
-        } else {
-            delta
-        };
-        Action::EmitWheelH(signed)
-    } else {
-        let signed = if scroll.reverse_vertical {
-            delta.reversed()
-        } else {
-            delta
-        };
-        Action::EmitWheelV(signed)
+/// Apply reverse flags for the locked scroll axis and return the
+/// appropriate `EmitWheelV` / `EmitWheelH` action.
+fn emit(delta: WheelDelta, scroll: &Scroll, axis: ScrollAxis) -> Action {
+    match axis {
+        ScrollAxis::Horizontal => {
+            let signed = if scroll.reverse_horizontal {
+                delta.reversed()
+            } else {
+                delta
+            };
+            Action::EmitWheelH(signed)
+        }
+        ScrollAxis::Vertical => {
+            let signed = if scroll.reverse_vertical {
+                delta.reversed()
+            } else {
+                delta
+            };
+            Action::EmitWheelV(signed)
+        }
     }
 }

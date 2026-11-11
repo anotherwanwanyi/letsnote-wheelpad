@@ -3,8 +3,8 @@
 use std::f64::consts::PI;
 
 use letsnote_wheelpad::detector::{
-    engagement_swept_angle, radial_gate_ok, within_horizontal_arc, CircularDetector, TouchSample,
-    WheelDelta, TRIGGER_ANGLE,
+    engagement_swept_angle, radial_gate_ok, radial_gate_ok_with_radius, within_horizontal_arc,
+    CircularDetector, TouchSample, WheelDelta, TRIGGER_ANGLE,
 };
 
 /// Generate N samples around a circle. Y is screen-down, so a positive
@@ -335,4 +335,57 @@ fn horizontal_arc_wraparound() {
     assert!(within_horizontal_arc(500, 500, east, 14, 2));
     assert!(within_horizontal_arc(500, 500, southeast, 14, 2));
     assert!(!within_horizontal_arc(500, 500, southwest, 14, 2));
+}
+
+#[test]
+fn step_polar_has_no_startup_surge_or_fast_to_slow_ghost_momentum() {
+    let mut d = CircularDetector::new();
+    let samples = circle_samples(500, 500, 300.0, 0.0, PI / 2.0, 19); // 5° per step
+    let mut step_v120 = Vec::new();
+    for s in &samples {
+        if d.push_if_moved(*s) {
+            let delta = d.step_polar(500, 500, 0);
+            if delta.v120 != 0 {
+                step_v120.push(delta.v120);
+            }
+        }
+    }
+    assert_eq!(step_v120.len(), 18);
+    // Every uniform 5° step should produce the same v120 (within ±1 rounding
+    // unit), without the 3.5x startup surge of the legacy 20-sample chord
+    // curvature moving average.
+    let min_v120 = *step_v120.iter().min().unwrap();
+    let max_v120 = *step_v120.iter().max().unwrap();
+    assert!(
+        (max_v120 - min_v120).abs() <= 1,
+        "uniform polar steps had non-uniform v120 output: {step_v120:?}"
+    );
+}
+
+#[test]
+fn radial_gate_with_radius_scales_proportionally() {
+    // For pad_radius = Some(385) and detect_area_width = 0, threshold is
+    // 0.68 * 385 = 261.8 units.
+    assert!(!radial_gate_ok_with_radius(
+        385,
+        385,
+        Some(385),
+        TouchSample { x: 385 + 250, y: 385 },
+        0
+    ));
+    assert!(radial_gate_ok_with_radius(
+        385,
+        385,
+        Some(385),
+        TouchSample { x: 385 + 270, y: 385 },
+        0
+    ));
+    // detect_area_width = 10 still unlocks the entire pad (threshold = 0).
+    assert!(radial_gate_ok_with_radius(
+        385,
+        385,
+        Some(385),
+        TouchSample { x: 385, y: 385 },
+        10
+    ));
 }
