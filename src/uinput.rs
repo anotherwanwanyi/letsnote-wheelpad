@@ -18,8 +18,8 @@ use std::path::Path;
 
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, Device, EventType, InputEvent, InputId,
-    PropType, RelativeAxisType, UinputAbsSetup,
+    AbsInfo, AttributeSet, BusType, Device, EventType, InputEvent, InputId, Key, PropType,
+    RelativeAxisType, UinputAbsSetup,
 };
 use tracing::warn;
 
@@ -44,10 +44,20 @@ impl UinputWheel {
         }
 
         let mut rel = AttributeSet::<RelativeAxisType>::new();
+        rel.insert(RelativeAxisType::REL_X);
+        rel.insert(RelativeAxisType::REL_Y);
         rel.insert(RelativeAxisType::REL_WHEEL);
         rel.insert(RelativeAxisType::REL_WHEEL_HI_RES);
         rel.insert(RelativeAxisType::REL_HWHEEL);
         rel.insert(RelativeAxisType::REL_HWHEEL_HI_RES);
+
+        // Advertise standard mouse buttons alongside REL_X/REL_Y so udev
+        // tags the virtual device with ID_INPUT_MOUSE=1 on both Wayland
+        // and X11 (xf86-input-libinput MatchIsPointer).
+        let mut keys = AttributeSet::<Key>::new();
+        keys.insert(Key::BTN_LEFT);
+        keys.insert(Key::BTN_RIGHT);
+        keys.insert(Key::BTN_MIDDLE);
 
         let dev = VirtualDeviceBuilder::new()
             .map_err(|source| Error::UinputCreate { source })?
@@ -58,6 +68,8 @@ impl UinputWheel {
                 WHEEL_PRODUCT_ID,
                 VERSION,
             ))
+            .with_keys(&keys)
+            .map_err(|source| Error::UinputCreate { source })?
             .with_relative_axes(&rel)
             .map_err(|source| Error::UinputCreate { source })?
             .build()
@@ -168,11 +180,10 @@ impl UinputTouchpad {
                 .map_err(|source| Error::UinputCreate { source })?;
         }
 
-        // Mirror EV_ABS. Each axis carries its own (min, max, fuzz, flat,
-        // resolution); we copy those verbatim so libinput's coordinate
-        // interpretation matches. `get_abs_state` returns the kernel
-        // `input_absinfo` struct, which we wrap in evdev's safe
-        // `AbsInfo` constructor.
+        // Mirror EV_ABS. Each axis carries its own (min, max, flat,
+        // resolution); we copy those so libinput's coordinate
+        // interpretation matches, but set `fuzz` to 0 on the virtual
+        // mirror because the kernel already defuzzed physical events once.
         if let Some(axes) = physical.supported_absolute_axes() {
             let abs_state = physical
                 .get_abs_state()
@@ -183,7 +194,7 @@ impl UinputTouchpad {
                     raw.value,
                     raw.minimum,
                     raw.maximum,
-                    raw.fuzz,
+                    0,
                     raw.flat,
                     raw.resolution,
                 );
@@ -237,30 +248,12 @@ impl UinputTouchpad {
     /// all (e.g., suppress while the FSM is in Scrolling).
     ///
     /// SYN_REPORTs in the input are stripped because `emit()` inserts
-    /// its own. When `strip_positions` is true, ABS_X / ABS_Y /
-    /// ABS_MT_POSITION_X / ABS_MT_POSITION_Y events are also dropped.
-    pub fn forward(&mut self, events: &[InputEvent], strip_positions: bool) -> Result<()> {
+    /// its own.
+    pub fn forward(&mut self, events: &[InputEvent]) -> Result<()> {
         let filtered: Vec<InputEvent> = events
             .iter()
             .copied()
-            .filter(|ev| {
-                if ev.event_type() == EventType::SYNCHRONIZATION {
-                    return false;
-                }
-                if strip_positions && ev.event_type() == EventType::ABSOLUTE {
-                    let axis = AbsoluteAxisType(ev.code());
-                    if matches!(
-                        axis,
-                        AbsoluteAxisType::ABS_X
-                            | AbsoluteAxisType::ABS_Y
-                            | AbsoluteAxisType::ABS_MT_POSITION_X
-                            | AbsoluteAxisType::ABS_MT_POSITION_Y
-                    ) {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|ev| ev.event_type() != EventType::SYNCHRONIZATION)
             .collect();
         if filtered.is_empty() {
             return Ok(());

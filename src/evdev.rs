@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use evdev::{AbsoluteAxisType, Device, EventType, InputEvent, Key};
+use evdev::{AbsoluteAxisType, BusType, Device, EventType, InputEvent, Key};
 
 use crate::detector::TouchSample;
 use crate::error::{Error, Result};
@@ -24,12 +24,20 @@ pub struct InputDevice {
     pub abs_y_max: i32,
     pub center_x: i32,
     pub center_y: i32,
+    pub radius: i32,
+    assembler: FrameAssembler,
+}
+
+#[derive(Debug)]
+struct FrameAssembler {
     /// Per-slot tracking IDs and last-seen (x, y). Slot index 0..MAX_MT_SLOTS-1.
     slots: [SlotState; MAX_MT_SLOTS],
     /// Current writing slot per ABS_MT_SLOT event.
     current_slot: usize,
     /// BTN_TOUCH summary; mirrors the kernel-reported any-finger-down state.
     contact: bool,
+    /// Trailing events not yet terminated by SYN_REPORT.
+    pending_events: Vec<InputEvent>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -106,12 +114,19 @@ impl InputDevice {
         let abs_y_max = yi.maximum;
         let center_x = (abs_x_min + abs_x_max) / 2;
         let center_y = (abs_y_min + abs_y_max) / 2;
+        let radius = ((abs_x_max - abs_x_min).min(abs_y_max - abs_y_min) / 2).max(1);
 
-        let slots = [SlotState {
-            tracking_id: -1,
-            x: 0,
-            y: 0,
-        }; MAX_MT_SLOTS];
+        let has_slot = abs.is_some_and(|a| a.contains(AbsoluteAxisType::ABS_MT_SLOT));
+        let current_slot = if has_slot {
+            abs_state[AbsoluteAxisType::ABS_MT_SLOT.0 as usize]
+                .value
+                .max(0) as usize
+        } else {
+            0
+        };
+        let contact = device
+            .get_key_state()
+            .is_ok_and(|k| k.contains(Key::BTN_TOUCH));
 
         Ok(Self {
             device,
@@ -121,20 +136,26 @@ impl InputDevice {
             abs_y_max,
             center_x,
             center_y,
-            slots,
-            current_slot: 0,
-            contact: false,
+            radius,
+            assembler: FrameAssembler::new(current_slot, contact),
         })
     }
 
-    /// Find a touchpad whose name matches `regex`. Returns the first match
-    /// found via `/dev/input/event*` enumeration.
+    /// Find a physical touchpad whose name matches `regex`. Skips virtual
+    /// uinput devices (such as our own mirrored touchpad) and companion
+    /// event nodes that lack multitouch touchpad capabilities.
     pub fn find_by_name(regex_str: &str) -> Result<PathBuf> {
         let re = regex::Regex::new(regex_str).map_err(|source| Error::RegexInvalid {
             pattern: regex_str.to_string(),
             source,
         })?;
         for (path, device) in evdev::enumerate() {
+            if device.input_id().bus_type() == BusType::BUS_VIRTUAL {
+                continue;
+            }
+            if !has_touchpad_capabilities(&device) {
+                continue;
+            }
             if let Some(name) = device.name() {
                 if re.is_match(name) {
                     return Ok(path);
@@ -144,6 +165,20 @@ impl InputDevice {
         Err(Error::DeviceNotFound {
             regex: regex_str.to_string(),
         })
+    }
+
+    /// Query the kernel for whether `BTN_TOUCH` is still physically pressed.
+    /// If no finger is down in the kernel, clears any stale internal slot
+    /// and contact state.
+    pub fn verify_active_contact(&mut self) -> bool {
+        let still_down = self
+            .device
+            .get_key_state()
+            .is_ok_and(|k| k.contains(Key::BTN_TOUCH));
+        if !still_down {
+            self.assembler.clear_contact_state();
+        }
+        still_down
     }
 
     /// Block until events are available, then return ALL complete
@@ -162,36 +197,90 @@ impl InputDevice {
             .fetch_events()
             .map_err(|source| Error::EvdevRead { source })?
             .collect();
+        let mut dropped = false;
+        let frames = self.assembler.ingest_events(events, &mut dropped);
+        if dropped {
+            let _ = self.verify_active_contact();
+        }
+        Ok(frames)
+    }
+}
+
+impl FrameAssembler {
+    fn new(current_slot: usize, contact: bool) -> Self {
+        Self {
+            slots: [SlotState {
+                tracking_id: -1,
+                x: 0,
+                y: 0,
+            }; MAX_MT_SLOTS],
+            current_slot,
+            contact,
+            pending_events: Vec::new(),
+        }
+    }
+
+    fn clear_contact_state(&mut self) {
+        self.contact = false;
+        for slot in &mut self.slots {
+            slot.tracking_id = -1;
+        }
+        self.pending_events.clear();
+    }
+
+    fn ingest_events<I>(&mut self, events: I, syn_dropped: &mut bool) -> Vec<PhysicalFrame>
+    where
+        I: IntoIterator<Item = InputEvent>,
+    {
         let mut frames: Vec<PhysicalFrame> = Vec::new();
-        let mut batch_events: Vec<InputEvent> = Vec::new();
         for ev in events {
-            batch_events.push(ev);
+            if self.pending_events.is_empty()
+                && ev.event_type() == EventType::ABSOLUTE
+                && is_per_slot_mt_axis(AbsoluteAxisType(ev.code()))
+                && self.current_slot < MAX_MT_SLOTS
+            {
+                // Prepend the active slot at the start of the frame if the
+                // kernel omitted ABS_MT_SLOT via delta-compression. This
+                // keeps the virtual touchpad's slot selection aligned even
+                // after an earlier multi-slot gesture was suppressed.
+                self.pending_events.push(InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_SLOT.0,
+                    self.current_slot as i32,
+                ));
+            }
+            self.pending_events.push(ev);
             match ev.event_type() {
                 EventType::ABSOLUTE => self.apply_abs(ev.code(), ev.value()),
                 EventType::KEY if ev.code() == Key::BTN_TOUCH.code() => {
                     self.contact = ev.value() != 0;
                 }
+                EventType::SYNCHRONIZATION if ev.code() == 3 => {
+                    // SYN_DROPPED: kernel ring buffer overflowed. Discard
+                    // the incomplete batch and signal caller to resync.
+                    *syn_dropped = true;
+                    self.pending_events.clear();
+                }
                 EventType::SYNCHRONIZATION if ev.code() == 0 => {
                     let frame = self.assemble_frame();
                     frames.push(PhysicalFrame {
                         frame,
-                        events: std::mem::take(&mut batch_events),
+                        events: std::mem::take(&mut self.pending_events),
                     });
                 }
                 _ => {}
             }
         }
-        // Trailing events without a closing SYN_REPORT are dropped.
-        // The kernel always closes each report with SYN; partial
-        // batches at the tail would indicate an evdev read split
-        // mid-report, which `fetch_events` shouldn't produce.
-        Ok(frames)
+        frames
     }
 
     fn apply_abs(&mut self, code: u16, value: i32) {
         let axis = AbsoluteAxisType(code);
         match axis {
-            AbsoluteAxisType::ABS_MT_SLOT if (value as usize) < MAX_MT_SLOTS => {
+            AbsoluteAxisType::ABS_MT_SLOT => {
+                // Always update `current_slot` so out-of-range slot indices
+                // are ignored by the `< MAX_MT_SLOTS` guards below instead
+                // of overwriting the previously selected valid slot.
                 self.current_slot = value as usize;
             }
             AbsoluteAxisType::ABS_MT_TRACKING_ID => {
@@ -240,5 +329,157 @@ impl InputDevice {
             contact: self.contact,
             touches,
         }
+    }
+}
+
+fn has_touchpad_capabilities(device: &Device) -> bool {
+    let abs = device.supported_absolute_axes();
+    let keys = device.supported_keys();
+    abs.is_some_and(|a| {
+        a.contains(AbsoluteAxisType::ABS_MT_POSITION_X)
+            && a.contains(AbsoluteAxisType::ABS_MT_POSITION_Y)
+    }) && keys.is_some_and(|k| k.contains(Key::BTN_TOUCH))
+}
+
+fn is_per_slot_mt_axis(axis: AbsoluteAxisType) -> bool {
+    matches!(
+        axis,
+        AbsoluteAxisType::ABS_MT_TOUCH_MAJOR
+            | AbsoluteAxisType::ABS_MT_TOUCH_MINOR
+            | AbsoluteAxisType::ABS_MT_WIDTH_MAJOR
+            | AbsoluteAxisType::ABS_MT_WIDTH_MINOR
+            | AbsoluteAxisType::ABS_MT_ORIENTATION
+            | AbsoluteAxisType::ABS_MT_POSITION_X
+            | AbsoluteAxisType::ABS_MT_POSITION_Y
+            | AbsoluteAxisType::ABS_MT_TOOL_TYPE
+            | AbsoluteAxisType::ABS_MT_BLOB_ID
+            | AbsoluteAxisType::ABS_MT_TRACKING_ID
+            | AbsoluteAxisType::ABS_MT_PRESSURE
+            | AbsoluteAxisType::ABS_MT_DISTANCE
+            | AbsoluteAxisType::ABS_MT_TOOL_X
+            | AbsoluteAxisType::ABS_MT_TOOL_Y
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn syn_report() -> InputEvent {
+        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)
+    }
+
+    #[test]
+    fn out_of_bounds_slot_does_not_corrupt_previous_slot() {
+        let mut asm = FrameAssembler::new(0, false);
+        let mut dropped = false;
+        let frames = asm.ingest_events(
+            [
+                InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_MT_SLOT.0, 0),
+                InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_TRACKING_ID.0,
+                    42,
+                ),
+                InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_POSITION_X.0,
+                    500,
+                ),
+                InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_POSITION_Y.0,
+                    600,
+                ),
+                // Out-of-range slot 20 must not overwrite slot 0.
+                InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_MT_SLOT.0, 20),
+                InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_TRACKING_ID.0,
+                    -1,
+                ),
+                InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_POSITION_X.0,
+                    999,
+                ),
+                InputEvent::new(EventType::KEY, Key::BTN_TOUCH.code(), 1),
+                syn_report(),
+            ],
+            &mut dropped,
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame.touches.len(), 1);
+        assert_eq!(frames[0].frame.touches[0].slot, 0);
+        assert_eq!(frames[0].frame.touches[0].tracking_id, 42);
+        assert_eq!(
+            frames[0].frame.touches[0].pos,
+            TouchSample { x: 500, y: 600 }
+        );
+    }
+
+    #[test]
+    fn trailing_events_without_syn_report_are_retained_for_next_frame() {
+        let mut asm = FrameAssembler::new(0, false);
+        let mut dropped = false;
+
+        let partial = asm.ingest_events(
+            [
+                InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_TRACKING_ID.0,
+                    7,
+                ),
+                InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_POSITION_X.0,
+                    300,
+                ),
+            ],
+            &mut dropped,
+        );
+        assert!(partial.is_empty());
+
+        let completed = asm.ingest_events(
+            [
+                InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_POSITION_Y.0,
+                    400,
+                ),
+                InputEvent::new(EventType::KEY, Key::BTN_TOUCH.code(), 1),
+                syn_report(),
+            ],
+            &mut dropped,
+        );
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].frame.touches.len(), 1);
+        assert_eq!(
+            completed[0].frame.touches[0].pos,
+            TouchSample { x: 300, y: 400 }
+        );
+        // Prepended ABS_MT_SLOT + 4 original events + SYN_REPORT = 6 events.
+        assert_eq!(completed[0].events.len(), 6);
+    }
+
+    #[test]
+    fn delta_compressed_frame_prepends_active_slot() {
+        let mut asm = FrameAssembler::new(1, true);
+        let mut dropped = false;
+        let frames = asm.ingest_events(
+            [
+                InputEvent::new(
+                    EventType::ABSOLUTE,
+                    AbsoluteAxisType::ABS_MT_TRACKING_ID.0,
+                    99,
+                ),
+                syn_report(),
+            ],
+            &mut dropped,
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].events[0].event_type(), EventType::ABSOLUTE);
+        assert_eq!(frames[0].events[0].code(), AbsoluteAxisType::ABS_MT_SLOT.0);
+        assert_eq!(frames[0].events[0].value(), 1);
     }
 }
