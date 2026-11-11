@@ -17,10 +17,10 @@ Works on Wayland and X11 by reading evdev events directly from the physical Syna
 
 ## Changes in this fork
 
-- Stop circular scrolling as soon as the finger stops moving instead of emitting residual scroll events.
-- Give ordinary multi-finger gestures priority before circular scrolling is captured, while keeping an already captured circular gesture stable.
-- Classify circular intent early while withholding candidate frames, avoiding the initial pointer twitch without making recognition needlessly insensitive.
-- Emit high-resolution wheel events for smoother scrolling and provide two extra-low sensitivity levels.
+- **Smooth, proportional high-resolution scrolling**: Integrates center-relative polar angle directly into ~125Hz `REL_WHEEL_HI_RES` events, removing startup jumps, trailing scroll lag, and low-frequency stepping.
+- **Better multi-finger gesture coexistence**: Scales the outer scroll ring to the touchpad's actual size and gives multi-finger gestures a brief preemption window so 2- and 3-finger swipes are not swallowed by circular capture.
+- **Stable scroll axis**: Locks vertical vs. horizontal scrolling when a gesture starts so full-circle scrolling never flips direction mid-circle.
+- **Event-stream & state-machine fixes**: Fixes stuck virtual contacts after consecutive circles, double cursor defuzzing, watchdog resets while pausing a finger on the pad, and companion evdev node misdetection.
 
 These changes were tested on a Panasonic Let's Note CF-FV1 running Arch Linux. This is provided for reference only and does not imply compatibility with other models.
 
@@ -112,7 +112,7 @@ systemctl --user restart letsnote-wheelpad.service
 | `scroll.horizontal_enable` | `false` | bool | Off by default; same as Windows. |
 | `scroll.reverse_horizontal` | `false` | bool | |
 | `scroll.sensitivity` | `0` | -4..+2 | Indexes the multiplier table `[5, 7, 10, 14, 20, 28, 40]`; `-4` and `-3` are extra-low Linux extensions. |
-| `scroll.detect_area_width` | `0` | 0..10 | `0` = require finger near the edge; `10` = whole pad. |
+| `scroll.detect_area_width` | `0` | 0..10 | `0` = outer 32% bezel ring (inner 68% radius reserved for pointer/multi-touch); `10` = whole pad. |
 | `scroll.horizontal_start` | `2` | 0..15 | π/8 units. Default 45° → 135° = the bottom edge of the pad. |
 | `scroll.horizontal_end` | `6` | 0..15 | |
 
@@ -122,11 +122,7 @@ systemctl --user restart letsnote-wheelpad.service
 journalctl --user -u letsnote-wheelpad -f
 ```
 
-If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the config (-4..+2). The daemon does not auto-calibrate — history capacity is fixed at 20 slots to match the Windows behaviour.
-
-### High-resolution scrolling
-
-After circular intent is captured, every accepted curvature update produces a fractional `REL_WHEEL_HI_RES` or `REL_HWHEEL_HI_RES` v120 delta; 120 units represent one wheel detent. Sub-unit rounding residue is retained, and the movement dead band is 8 device units so a paused gesture responds promptly when it resumes. The detector separately emits legacy `REL_WHEEL`/`REL_HWHEEL` whole notches at the original accumulator crossings for older applications. Conforming consumers select the high-resolution or legacy stream rather than adding them together. This makes active scrolling smoother but does not add coasting: a stationary finger still produces no events. The initial 7.5° intent-classification delay remains necessary to distinguish circular scrolling from pointer input.
+If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the config (-4..+2).
 
 ## Known issues / non-goals
 
@@ -134,23 +130,6 @@ After circular intent is captured, every accepted curvature update produces a fr
 - **Hardware coverage is limited.** Touchpads whose evdev names do not match the default pattern require the configuration and udev override described above. Compatibility with other hardware is not guaranteed.
 - **Excel arrow-key fallback is gone.** Modern Excel routes horizontal wheel events natively; we don't need the Windows hack.
 - **No coasting/kinetic scrolling.** Matches the Windows WheelPad behaviour; xf86 has it but we don't.
-
-## Multi-finger gesture priority
-
-Circular scrolling is a single-finger gesture. Before it is captured, normal multi-finger gestures have priority:
-
-- While an outer-ring single-finger gesture is still a candidate, its complete `SYN_REPORT` frames are held briefly instead of being forwarded immediately. If a second finger appears, the held frames are replayed unchanged and the daemon enters passthrough-only `MultiTouch` mode. Circular recognition then stays disabled until every finger has lifted; removing only the second finger does not re-arm it halfway through the gesture.
-- Capture requires at least three meaningful samples, 7.5° of angular travel, tangential motion that dominates radial motion, and net curvature consistent with the travel direction. Crossing 7.5° without enough evidence remains pending instead of permanently rejecting the gesture; this lets a dense, noisy, or slowly developing arc continue into circular scrolling. Clear radial motion, a sustained straight tangent, or the 20-meaningful-sample observation limit selects ordinary pointer input instead. The held frames are then replayed unchanged and `Passthrough` remains locked in until all-up. A separate 64-raw-frame safety limit bounds buffering when reports contain almost no meaningful movement.
-- Once circular scrolling is captured, the held frames are discarded, so libinput never sees the captured contact and there is no initial cursor twitch. Fingers added after capture are also hidden, and the detector remains locked to the original tracking ID. If that original finger lifts first, another finger is never substituted into its circular trajectory.
-- Because a captured contact is never started on the virtual touchpad, its final lift can be suppressed without synthesizing slot or touch-key cleanup events and without leaving a stale contact in libinput.
-
-In short: multi-finger input wins before circular capture; an already captured circular gesture keeps ownership until all-up. The next contact sequence starts a fresh arbitration.
-
-## How it works (one-paragraph version)
-
-The daemon takes exclusive ownership of the physical touchpad at startup (`EVIOCGRAB`, held forever) and creates two virtual `uinput` devices that libinput attaches to instead: a touchpad mirror (same capabilities as the physical pad) and a wheel. A 7-state FSM (`Idle`, `Contact`, `Moving`, `MultiTouch`, `Passthrough`, `Scrolling`, `Debounce`) arbitrates input. Ordinary events are forwarded verbatim; an outer-ring single-finger candidate is the exception, with complete frames held while `Moving` classifies its early trajectory. A pointer or multi-finger decision replays those frames in order, while a circular decision discards them and suppresses the rest of that physical contact stream. The circular detector is preheated with the candidate samples, then integrates chord-direction angles into fractional v120 high-resolution movement while retaining legacy whole-notch output for compatibility. Since a captured touch never reaches the virtual touchpad at all, it produces neither an initial cursor jump nor stale libinput contact state at all-up.
-
-The circular detector and gesture arbitration are covered by the synthetic tests in `tests/algorithm_synthetic.rs` and `tests/fsm_synthetic.rs`.
 
 ## License
 
